@@ -913,78 +913,6 @@ def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DI
     return out
 
 
-def train_refinement_model(
-    refine_model: RefinementModel,
-    ensemble_model: nn.Module,
-    train_loader: DataLoader,
-    cfg: TrainConfig,
-) -> None:
-    refine_model.to(DEVICE)
-    ensemble_model.to(DEVICE).eval()
-    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
-    scaler = GradScaler("cuda", enabled=USE_AMP)
-
-    for ep in range(1, cfg.epochs + 1):
-        refine_model.train()
-        run_loss = 0.0
-        for x, y in train_loader:
-            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                p1 = normalize_segmentation_output(ensemble_model(x), ref_shape=y.shape[2:])
-            with autocast(device_type="cuda", enabled=USE_AMP):
-                ref_input = torch.cat([x, p1], dim=1)
-                p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
-                loss = combined_seg_loss(p2, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            run_loss += loss.item()
-        print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
-
-
-def train_single_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    cfg: TrainConfig,
-    model_name: str = "Model",
-) -> None:
-    """Uniform base-model fine-tuning loop used for fair comparison."""
-    model.to(DEVICE)
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    scaler = GradScaler("cuda", enabled=USE_AMP)
-    for ep in range(1, cfg.epochs + 1):
-        run_loss = 0.0
-        model.train()
-        for x, y in train_loader:
-            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type="cuda", enabled=USE_AMP):
-                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss = combined_seg_loss(p, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            run_loss += loss.item()
-        print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
-
-
-def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = output_dir / f"{name.lower().replace('+', 'plus').replace(' ', '_')}.pth"
-    torch.save(model.state_dict(), ckpt_path)
-    return ckpt_path
-
-
-def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DIR) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    hp_df = pd.DataFrame([params])
-    out = output_dir / "run_hyperparameters.csv"
-    hp_df.to_csv(out, index=False)
-    return out
-
-
 # =========================
 # Cell 9: End-to-end run
 # =========================
@@ -1371,8 +1299,8 @@ def run_full_pipeline() -> None:
     epochs = int(os.environ.get("EPOCHS", "12"))
     base_epochs = int(os.environ.get("BASE_EPOCHS", "2"))
     batch_size = int(os.environ.get("BATCH_SIZE", "8"))
-    img_size = int(os.environ.get("IMG_SIZE", "256"))
-    finetune_size = int(os.environ.get("FINETUNE_SIZE", "320"))
+    img_size = int(os.environ.get("IMG_SIZE", "320"))
+    finetune_size = int(os.environ.get("FINETUNE_SIZE", str(img_size)))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
     output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1388,6 +1316,10 @@ def run_full_pipeline() -> None:
             "amp": USE_AMP,
         },
         output_dir=output_dir,
+    )
+    print(
+        f"[INFO] Uniform setup -> IMG_SIZE={img_size}, FINETUNE_SIZE={finetune_size}, "
+        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}"
     )
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
@@ -1412,13 +1344,16 @@ def run_full_pipeline() -> None:
         batch_size=batch_size,
         num_workers=num_workers,
     )
-    # Optional high-resolution fine-tune loaders.
-    train_loader_ft, val_loader_ft = make_loaders(
-        data_dir,
-        size=finetune_size,
-        batch_size=max(1, batch_size // 2),
-        num_workers=num_workers,
-    )
+    # Uniform loader setup by default (same resolution for base/ensemble/refinement).
+    if finetune_size == img_size:
+        train_loader_ft, val_loader_ft = train_loader, val_loader
+    else:
+        train_loader_ft, val_loader_ft = make_loaders(
+            data_dir,
+            size=finetune_size,
+            batch_size=max(1, batch_size // 2),
+            num_workers=num_workers,
+        )
     # 1) Uniform base-model training before ensemble training.
     if base_epochs > 0:
         train_single_model(
@@ -1557,11 +1492,9 @@ if __name__ == "__main__":
             "  %env RESUNET_REPO=/content/ResUNetPlusPlus\n"
             "  # optional for auto-clone:\n"
             "  %env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git\n"
-            "  # train from scratch by default:\n"
+            "  # train from scratch (recommended):\n"
             "  %env USE_CKPT=0\n"
-            "  # if you want to warm-start, set USE_CKPT=1 and provide paths below:\n"
-            "  %env RESUNET_CKPT=/content/drive/MyDrive/.../best_resunetpp_model.pth\n"
-            "  %env WDFF_CKPT=/content/drive/MyDrive/.../best_wdffnet.pth\n"
-            "  %env TRANSFUSE_CKPT=/content/drive/MyDrive/.../best_transfuse_model.pth\n"
+            "  %env IMG_SIZE=320\n"
+            "  %env FINETUNE_SIZE=320\n"
             "  %run colab_har_ensemble.py"
         )

@@ -14,6 +14,7 @@ import os
 import random
 import subprocess
 import importlib.util
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -90,6 +91,7 @@ else:
     DEVICE = torch.device("cpu")
 USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
+OUTPUT_DIR = Path("/content/drive/MyDrive/ensemble_outputs")
 
 
 # =========================
@@ -474,9 +476,17 @@ class HAREnsemble(nn.Module):
 
         self.attn = ChannelSpatialAttention(in_channels=3)
         self.weight_head = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, 1),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 3, 1),
+            nn.Softmax(dim=1),
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(3, 1, kernel_size=7, padding=3),
+            nn.Sigmoid(),
         )
         self._printed_debug = False
 
@@ -498,10 +508,59 @@ class HAREnsemble(nn.Module):
 
         stack = torch.cat([p1, p2, p3], dim=1)
         stack = self.attn(stack)
-        logits = self.weight_head(stack)
-        weights = torch.softmax(logits, dim=1)
-        fused = (weights * stack).sum(dim=1, keepdim=True)
+        weights = self.weight_head(stack)
+        wr, wt, ww = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+        fused = wr * p1 + wt * p3 + ww * p2
+        fused = fused * self.spatial_attention(stack)
         return fused
+
+
+class RefinementModel(nn.Module):
+    """Small UNet-like second stage that refines ensemble predictions."""
+
+    def __init__(self, in_channels: int = 4, base_channels: int = 32):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels * 4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 4, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.ConvTranspose2d(base_channels * 2, base_channels * 2, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Conv2d(base_channels, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+        d2 = self.dec2(torch.cat([self.up2(b), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return torch.sigmoid(self.head(d1))
 
 
 # =========================
@@ -543,6 +602,24 @@ def _bin(pred: torch.Tensor, th: float = 0.5) -> torch.Tensor:
     return (pred > th).float()
 
 
+def dice_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6) -> float:
+    pred = _bin(pred, threshold).reshape(-1)
+    target = _bin(target).reshape(-1)
+    tp = ((pred == 1) & (target == 1)).sum().item()
+    fp = ((pred == 1) & (target == 0)).sum().item()
+    fn = ((pred == 0) & (target == 1)).sum().item()
+    return float((2 * tp + eps) / (2 * tp + fp + fn + eps))
+
+
+def iou_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6) -> float:
+    pred = _bin(pred, threshold).reshape(-1)
+    target = _bin(target).reshape(-1)
+    tp = ((pred == 1) & (target == 1)).sum().item()
+    fp = ((pred == 1) & (target == 0)).sum().item()
+    fn = ((pred == 0) & (target == 1)).sum().item()
+    return float((tp + eps) / (tp + fp + fn + eps))
+
+
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
     pred = _bin(pred, th=threshold)
     target = _bin(target)
@@ -554,8 +631,8 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float =
     fn = ((pred_f == 0) & (tar_f == 1)).sum().item()
     tn = ((pred_f == 0) & (tar_f == 0)).sum().item()
 
-    dice = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
-    iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
+    dice = dice_score(pred, target, threshold=0.5)
+    iou = iou_score(pred, target, threshold=0.5)
     precision = (tp + 1e-6) / (tp + fp + 1e-6)
     recall = (tp + 1e-6) / (tp + fn + 1e-6)
     f1 = (2 * precision * recall + 1e-6) / (precision + recall + 1e-6)
@@ -564,12 +641,29 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float =
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5) -> Dict[str, float]:
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+    use_postprocess: bool = False,
+    use_tta: bool = False,
+) -> Dict[str, float]:
     model.eval()
     agg = {"Dice": [], "IoU": [], "Accuracy": [], "Precision": [], "Recall": [], "F1": []}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        if use_tta:
+            p = tta_predict(model, x)
+        else:
+            p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        if use_postprocess:
+            p_np = p.detach().cpu().numpy()
+            pp = []
+            for bi in range(p_np.shape[0]):
+                proc = post_process_mask((p_np[bi, 0] > threshold).astype(np.uint8))
+                pp.append(torch.from_numpy((proc > 0).astype(np.float32))[None, ...])
+            p = torch.stack(pp, dim=0).to(device)
         batch_metrics = compute_metrics(p, y, threshold=threshold)
         for k, v in batch_metrics.items():
             agg[k].append(v)
@@ -577,17 +671,63 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, t
 
 
 @torch.no_grad()
-def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
-    """Tune binary threshold for best validation Dice."""
-    candidates = np.linspace(0.30, 0.70, 17)
+def collect_preds_and_masks(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_tta: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    preds, masks = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if use_tta:
+            p = tta_predict(model, x)
+        else:
+            p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        preds.append(p.detach().cpu())
+        masks.append(y.detach().cpu())
+    return torch.cat(preds, dim=0), torch.cat(masks, dim=0)
+
+
+def find_best_threshold(preds: torch.Tensor, masks: torch.Tensor) -> float:
+    """Search thresholds from 0.20 to 0.60 (step 0.05) and pick best Dice."""
+    candidates = np.arange(0.20, 0.61, 0.05)
     best_t, best_dice = 0.5, -1.0
     for t in candidates:
-        m = evaluate_model(model, loader, device, threshold=float(t))
-        if m["Dice"] > best_dice:
-            best_dice = m["Dice"]
+        d = dice_score(preds, masks, threshold=float(t))
+        if d > best_dice:
+            best_dice = d
             best_t = float(t)
     print(f"[HAR] Best validation threshold: {best_t:.2f} (Dice={best_dice:.4f})")
     return best_t
+
+
+def multi_scale_predict(model: nn.Module, img: torch.Tensor, scales: Iterable[float] = (0.75, 1.0, 1.25)) -> torch.Tensor:
+    """Run model at multiple scales and return averaged sigmoid output."""
+    model.eval()
+    _, _, h, w = img.shape
+    preds = []
+    for s in scales:
+        nh = max(16, int(round(h * s)))
+        nw = max(16, int(round(w * s)))
+        scaled = F.interpolate(img, size=(nh, nw), mode="bilinear", align_corners=False)
+        pred = normalize_segmentation_output(model(scaled), ref_shape=(nh, nw))
+        pred = F.interpolate(pred, size=(h, w), mode="bilinear", align_corners=False)
+        preds.append(pred)
+    return torch.mean(torch.stack(preds, dim=0), dim=0)
+
+
+def tta_predict(model: nn.Module, img: torch.Tensor) -> torch.Tensor:
+    """TTA with horizontal/vertical flips, each branch using multi-scale inference."""
+    model.eval()
+    preds = [multi_scale_predict(model, img)]
+    fh = torch.flip(img, dims=[3])
+    preds.append(torch.flip(multi_scale_predict(model, fh), dims=[3]))
+    fv = torch.flip(img, dims=[2])
+    preds.append(torch.flip(multi_scale_predict(model, fv), dims=[2]))
+    return torch.mean(torch.stack(preds, dim=0), dim=0)
 
 
 # =========================
@@ -609,9 +749,32 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
     return 1 - dice.mean()
 
 
+def focal_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.8, gamma: float = 2.0) -> torch.Tensor:
+    pred = pred.clamp(1e-6, 1 - 1e-6)
+    bce = F.binary_cross_entropy(pred, target, reduction="none")
+    pt = torch.where(target == 1, pred, 1 - pred)
+    return (alpha * (1 - pt) ** gamma * bce).mean()
+
+
+def boundary_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Boundary-aware loss via Laplacian-like gradient mismatch."""
+    kernel = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    pred_b = torch.abs(F.conv2d(pred, kernel, padding=1))
+    tar_b = torch.abs(F.conv2d(target, kernel, padding=1))
+    return F.l1_loss(pred_b, tar_b)
+
+
+def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    loss_bce = F.binary_cross_entropy(pred.float(), target.float())
+    loss_dice = dice_loss(pred, target)
+    loss_focal = focal_loss(pred, target)
+    loss_boundary = boundary_loss(pred, target)
+    return 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
+
+
 def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfig):
     optimizer = torch.optim.Adam(
-        list(model.attn.parameters()) + list(model.weight_head.parameters()),
+        list(model.attn.parameters()) + list(model.weight_head.parameters()) + list(model.spatial_attention.parameters()),
         lr=cfg.lr,
     )
     scaler = GradScaler("cuda", enabled=USE_AMP)
@@ -625,16 +788,46 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss_dice = dice_loss(p, y)
-            # BCE is not autocast-safe; run in full precision outside autocast.
-            loss_bce = F.binary_cross_entropy(p.float(), y.float())
-            loss = 0.5 * loss_bce + 0.5 * loss_dice
+                loss = combined_seg_loss(p, y)
+                batch_dice = dice_score(p.detach(), y.detach(), threshold=0.5)
+                if batch_dice < 0.7:
+                    loss = loss * 1.5
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             run_loss += loss.item()
         print(f"Epoch {ep}/{cfg.epochs} | HAR head loss: {run_loss / len(train_loader):.4f}")
+
+
+def train_refinement_model(
+    refine_model: RefinementModel,
+    ensemble_model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+) -> None:
+    refine_model.to(DEVICE)
+    ensemble_model.to(DEVICE).eval()
+    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+
+    for ep in range(1, cfg.epochs + 1):
+        refine_model.train()
+        run_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                p1 = normalize_segmentation_output(ensemble_model(x), ref_shape=y.shape[2:])
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                ref_input = torch.cat([x, p1], dim=1)
+                p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p2, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
 
 
 # =========================
@@ -702,6 +895,104 @@ def mount_drive_if_needed() -> None:
         drive.mount("/content/drive")
 
 
+def post_process_mask(mask: np.ndarray, min_area: int = 100) -> np.ndarray:
+    """Median blur + closing + small component removal."""
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    mask_u8 = cv2.medianBlur(mask_u8, 5)
+    kernel = np.ones((5, 5), np.uint8)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    cleaned = np.zeros_like(mask_u8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+    return cleaned
+
+
+def save_plot(fig, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / name
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    return path
+
+
+def visualize_predictions(model: nn.Module, loader: DataLoader, output_dir: Path = OUTPUT_DIR, num_samples: int = 4) -> None:
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    shown = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(DEVICE)
+            pred = tta_predict(model, x)
+            for bi in range(x.size(0)):
+                if shown >= num_samples:
+                    return
+                img = x[bi].detach().cpu().permute(1, 2, 0).numpy()
+                img = (img * np.array(IMAGENET_STD) + np.array(IMAGENET_MEAN)).clip(0, 1)
+                gt = y[bi, 0].detach().cpu().numpy()
+                pr = (pred[bi, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+                pr = post_process_mask(pr)
+
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                axes[0].imshow(img)
+                axes[0].set_title("Image")
+                axes[1].imshow(gt, cmap="gray")
+                axes[1].set_title("GT")
+                axes[2].imshow(pr, cmap="gray")
+                axes[2].set_title("Pred")
+                for ax in axes:
+                    ax.axis("off")
+                save_plot(fig, f"prediction_{shown:03d}.png", output_dir=output_dir)
+                plt.close(fig)
+                shown += 1
+
+
+def plot_metrics(df: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> None:
+    import matplotlib.pyplot as plt
+
+    for metric in ["Dice", "IoU"]:
+        fig = plt.figure(figsize=(8, 4))
+        plt.plot(df["Model"], df[metric], marker="o")
+        plt.xticks(rotation=20, ha="right")
+        plt.ylabel(metric)
+        plt.grid(alpha=0.3)
+        plt.title(f"{metric} Comparison")
+        save_plot(fig, f"{metric.lower()}_plot.png", output_dir=output_dir)
+        plt.close(fig)
+
+
+@torch.no_grad()
+def estimate_fps(model: nn.Module, loader: DataLoader, warmup: int = 3, measured_batches: int = 10) -> float:
+    model.eval()
+    iterator = iter(loader)
+    for _ in range(warmup):
+        try:
+            x, _ = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            x, _ = next(iterator)
+        _ = model(x.to(DEVICE))
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+    seen = 0
+    start = time.time()
+    for _ in range(measured_batches):
+        try:
+            x, _ = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            x, _ = next(iterator)
+        _ = model(x.to(DEVICE))
+        seen += x.size(0)
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(1e-6, time.time() - start)
+    return seen / elapsed
+
+
 def run_full_pipeline() -> None:
     """
     Execute full HAR pipeline using environment variables.
@@ -709,7 +1000,7 @@ def run_full_pipeline() -> None:
     Required:
       DATA_DIR, RESUNET_REPO, RESUNET_CKPT, TRANSFUSE_CKPT
     Optional:
-      WDFF_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, NUM_WORKERS
+      WDFF_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, FINETUNE_SIZE, NUM_WORKERS
     """
     mount_drive_if_needed()
 
@@ -741,7 +1032,8 @@ def run_full_pipeline() -> None:
 
     epochs = int(os.environ.get("EPOCHS", "12"))
     batch_size = int(os.environ.get("BATCH_SIZE", "8"))
-    img_size = int(os.environ.get("IMG_SIZE", "352"))
+    img_size = int(os.environ.get("IMG_SIZE", "256"))
+    finetune_size = int(os.environ.get("FINETUNE_SIZE", "320"))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
@@ -759,31 +1051,74 @@ def run_full_pipeline() -> None:
         batch_size=batch_size,
         num_workers=num_workers,
     )
+    # Optional high-resolution fine-tune loaders.
+    train_loader_ft, val_loader_ft = make_loaders(
+        data_dir,
+        size=finetune_size,
+        batch_size=max(1, batch_size // 2),
+        num_workers=num_workers,
+    )
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
     train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
-    best_thr = find_best_threshold(har, val_loader, DEVICE)
+    if finetune_size > img_size:
+        train_har_head(har, train_loader_ft, TrainConfig(epochs=max(2, epochs // 3), lr=5e-4))
+
+    refine_model = RefinementModel().to(DEVICE)
+    train_refinement_model(refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4))
+
+    class CascadeWrapper(nn.Module):
+        def __init__(self, ens: nn.Module, ref: nn.Module):
+            super().__init__()
+            self.ens = ens
+            self.ref = ref
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            p1 = normalize_segmentation_output(self.ens(x), ref_shape=x.shape[2:])
+            p2 = self.ref(torch.cat([x, p1], dim=1))
+            return normalize_segmentation_output(p2, ref_shape=x.shape[2:])
+
+    cascade_model = CascadeWrapper(har, refine_model).to(DEVICE)
+    val_preds, val_masks = collect_preds_and_masks(cascade_model, val_loader_ft, DEVICE, use_tta=True)
+    best_thr = find_best_threshold(val_preds, val_masks)
 
     base_wrappers = {
         "ResUNet++": resunetpp,
         "WDFFNet": wdffnet,
         "TransFuse": transfuse,
         "HAR Ensemble": har,
+        "HAR+Refine": cascade_model,
     }
 
-    rows = []
+    rows, csv_rows = [], []
     for name, mdl in base_wrappers.items():
-        threshold = best_thr if name == "HAR Ensemble" else 0.5
-        m = evaluate_model(mdl, val_loader, DEVICE, threshold=threshold)
-        rows.append([name, m["Dice"], m["IoU"], m["Accuracy"], m["Precision"], m["Recall"], m["F1"]])
+        threshold = best_thr if name in ("HAR Ensemble", "HAR+Refine") else 0.5
+        m = evaluate_model(
+            mdl,
+            val_loader_ft,
+            DEVICE,
+            threshold=threshold,
+            use_postprocess=(name == "HAR+Refine"),
+            use_tta=(name == "HAR+Refine"),
+        )
+        params = sum(p.numel() for p in mdl.parameters()) / 1e6
+        fps = estimate_fps(mdl, val_loader_ft)
+        rows.append([name, m["Dice"], m["IoU"], params, fps])
+        csv_rows.append({"Model": name, "Dice": m["Dice"], "IoU": m["IoU"], "Params(M)": params, "FPS": fps})
 
     print(
         tabulate(
             rows,
-            headers=["Model", "Dice", "IoU", "Accuracy", "Precision", "Recall", "F1"],
+            headers=["Model", "Dice", "IoU", "Params(M)", "FPS"],
             floatfmt=".4f",
             tablefmt="github",
         )
     )
+    output_dir = OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    comp_df = pd.DataFrame(csv_rows)
+    comp_df.to_csv(output_dir / "comparison_table.csv", index=False)
+    plot_metrics(comp_df, output_dir=output_dir)
+    visualize_predictions(cascade_model, val_loader_ft, output_dir=output_dir, num_samples=6)
 
 
 if __name__ == "__main__":

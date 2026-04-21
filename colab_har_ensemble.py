@@ -964,6 +964,65 @@ def plot_metrics(df: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> None:
 
 
 @torch.no_grad()
+def analyze_models_on_images(
+    models: Dict[str, nn.Module],
+    image_paths: List[str],
+    output_file: str = "model_comparison_samples.png",
+    output_dir: Path = OUTPUT_DIR,
+    image_size: int = 320,
+    threshold: float = 0.5,
+) -> Path:
+    """
+    Analyze 1-2 images with ResUNet++, TransFuse, WDFFNet, and Ensemble in one file.
+    Produces a single comparison sheet: rows=samples, cols=[Image, each model prediction].
+    """
+    import matplotlib.pyplot as plt
+
+    if not image_paths:
+        raise ValueError("image_paths cannot be empty.")
+    image_paths = image_paths[:2]  # user requested one or two samples
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_names = list(models.keys())
+    for m in models.values():
+        m.to(DEVICE).eval()
+
+    tf = A.Compose([A.Resize(image_size, image_size), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+    nrows = len(image_paths)
+    ncols = 1 + len(model_names)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for r, img_path in enumerate(image_paths):
+        rgb = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+        aug = tf(image=rgb)
+        x_np = aug["image"].astype("float32").transpose(2, 0, 1)
+        x = torch.from_numpy(x_np).unsqueeze(0).to(DEVICE)
+
+        axes[r, 0].imshow(rgb)
+        axes[r, 0].set_title(f"Input #{r + 1}")
+        axes[r, 0].axis("off")
+
+        for c, model_name in enumerate(model_names, start=1):
+            model = models[model_name]
+            pred = tta_predict(model, x) if model_name.lower().startswith("har") else multi_scale_predict(model, x)
+            pred_np = pred[0, 0].detach().cpu().numpy()
+            mask = (pred_np > threshold).astype(np.uint8)
+            mask = post_process_mask(mask)
+            axes[r, c].imshow(mask, cmap="gray")
+            axes[r, c].set_title(model_name)
+            axes[r, c].axis("off")
+
+    fig.tight_layout()
+    out_path = output_dir / output_file
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] model comparison sheet: {out_path}")
+    return out_path
+
+
+@torch.no_grad()
 def estimate_fps(model: nn.Module, loader: DataLoader, warmup: int = 3, measured_batches: int = 10) -> float:
     model.eval()
     iterator = iter(loader)
@@ -1119,6 +1178,26 @@ def run_full_pipeline() -> None:
     comp_df.to_csv(output_dir / "comparison_table.csv", index=False)
     plot_metrics(comp_df, output_dir=output_dir)
     visualize_predictions(cascade_model, val_loader_ft, output_dir=output_dir, num_samples=6)
+    # Optional: compare 1-2 specific images across base models + ensemble in one file.
+    # Example:
+    #   %env ANALYZE_IMAGES=/content/data/Kvasir-SEG/images/cju0qkwl35piu0993l0dewei2.jpg,/content/data/Kvasir-SEG/images/xxx.jpg
+    analyze_images = os.environ.get("ANALYZE_IMAGES", "").strip()
+    if analyze_images:
+        selected = [p.strip() for p in analyze_images.split(",") if p.strip() and os.path.exists(p.strip())][:2]
+        if selected:
+            analyze_models_on_images(
+                models={
+                    "ResUNet++": resunetpp,
+                    "TransFuse": transfuse,
+                    "WDFFNet": wdffnet,
+                    "HAR Ensemble": har,
+                },
+                image_paths=selected,
+                output_file="studied_models_comparison.png",
+                output_dir=output_dir,
+                image_size=finetune_size,
+                threshold=best_thr,
+            )
 
 
 if __name__ == "__main__":

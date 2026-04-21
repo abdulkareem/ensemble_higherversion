@@ -883,6 +883,63 @@ def _must_exist(path: Optional[str], label: str) -> Optional[str]:
     return path
 
 
+def _auto_prepare_data_dir() -> Optional[str]:
+    """
+    Resolve dataset path more robustly for Colab.
+    Priority:
+      1) DATA_DIR if exists
+      2) Extract DATA_ZIP (if provided) to /content/data/
+      3) Check common Colab/Drive fallback locations
+    """
+    data_dir = _env_path("DATA_DIR")
+    if data_dir and os.path.exists(data_dir):
+        return data_dir
+
+    data_zip = _env_path("DATA_ZIP")
+    if data_zip and os.path.exists(data_zip):
+        target_root = Path("/content/data")
+        target_root.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Extracting dataset zip: {data_zip} -> {target_root}")
+        subprocess.run(["unzip", "-o", data_zip, "-d", str(target_root)], check=True)
+        # Try common extracted folder names.
+        candidates = [
+            target_root / "Kvasir-SEG",
+            target_root / "kvasir-seg",
+            target_root / "Kvasir_SEG",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+
+    fallback_candidates = [
+        "/content/data/Kvasir-SEG",
+        "/content/Kvasir-SEG",
+        "/content/drive/MyDrive/Kvasir-SEG",
+        "/content/drive/MyDrive/data/Kvasir-SEG",
+    ]
+    for c in fallback_candidates:
+        if os.path.exists(c):
+            print(f"[INFO] Using fallback DATA_DIR: {c}")
+            return c
+    return None
+
+
+def _auto_prepare_resunet_repo() -> Optional[str]:
+    """Resolve or optionally clone ResUNet++ repository in Colab."""
+    repo = _env_path("RESUNET_REPO")
+    if repo and os.path.exists(repo):
+        return repo
+
+    repo_url = _env_path("RESUNET_REPO_URL") or "https://github.com/DebeshJha/ResUNetPlusPlus.git"
+    default_repo = Path("/content/ResUNetPlusPlus")
+    if not default_repo.exists():
+        print(f"[INFO] Cloning ResUNet++ repo from: {repo_url}")
+        clone_repo_if_needed(repo_url, str(default_repo))
+    if default_repo.exists():
+        return str(default_repo)
+    return None
+
+
 def mount_drive_if_needed() -> None:
     """Mount Google Drive only when running inside Colab and not already mounted."""
     in_colab = importlib.util.find_spec("google.colab") is not None
@@ -1063,8 +1120,8 @@ def run_full_pipeline() -> None:
     """
     mount_drive_if_needed()
 
-    data_dir = _must_exist(_env_path("DATA_DIR"), "DATA_DIR")
-    resunet_repo = _must_exist(_env_path("RESUNET_REPO"), "RESUNET_REPO")
+    data_dir = _must_exist(_auto_prepare_data_dir(), "DATA_DIR")
+    resunet_repo = _must_exist(_auto_prepare_resunet_repo(), "RESUNET_REPO")
     resunet_ckpt = _must_exist(_env_path("RESUNET_CKPT"), "RESUNET_CKPT")
     transfuse_ckpt = _must_exist(_env_path("TRANSFUSE_CKPT"), "TRANSFUSE_CKPT")
     wdff_ckpt = _env_path("WDFF_CKPT")
@@ -1086,7 +1143,10 @@ def run_full_pipeline() -> None:
         raise ValueError(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + ".\nSet them before running `%run colab_har_ensemble.py`."
+            + ".\nSet them before running `%run colab_har_ensemble.py`.\n"
+            + "Tips:\n"
+            + "  - Set DATA_DIR directly, or set DATA_ZIP to a zip path in Drive.\n"
+            + "  - Set RESUNET_REPO directly, or optionally set RESUNET_REPO_URL for auto-clone."
         )
 
     epochs = int(os.environ.get("EPOCHS", "12"))
@@ -1216,7 +1276,11 @@ if __name__ == "__main__":
         print(
             "[INFO] To run in Colab, set env vars first:\n"
             "  %env DATA_DIR=/content/data/Kvasir-SEG\n"
+            "  # or provide zipped dataset:\n"
+            "  %env DATA_ZIP=/content/drive/MyDrive/datasets/Kvasir-SEG.zip\n"
             "  %env RESUNET_REPO=/content/ResUNetPlusPlus\n"
+            "  # optional for auto-clone:\n"
+            "  %env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git\n"
             "  %env RESUNET_CKPT=/content/drive/MyDrive/.../best_resunetpp_model.pth\n"
             "  %env WDFF_CKPT=/content/drive/MyDrive/.../best_wdffnet.pth\n"
             "  %env TRANSFUSE_CKPT=/content/drive/MyDrive/.../best_transfuse_model.pth\n"

@@ -772,7 +772,14 @@ def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
 
 
-def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfig):
+def train_har_head(
+    model: HAREnsemble,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    val_loader: Optional[DataLoader] = None,
+    model_name: str = "har_ensemble",
+    output_dir: Path = OUTPUT_DIR,
+):
     optimizer = torch.optim.Adam(
         list(model.attn.parameters()) + list(model.weight_head.parameters()) + list(model.spatial_attention.parameters()),
         lr=cfg.lr,
@@ -780,6 +787,7 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
     scaler = GradScaler("cuda", enabled=USE_AMP)
 
     model.to(DEVICE)
+    best_dice = -1.0
     for ep in range(1, cfg.epochs + 1):
         model.train()
         run_loss = 0.0
@@ -798,6 +806,111 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
             scaler.update()
             run_loss += loss.item()
         print(f"Epoch {ep}/{cfg.epochs} | HAR head loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            print(f"[HAR] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+
+
+def train_refinement_model(
+    refine_model: RefinementModel,
+    ensemble_model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    val_loader: Optional[DataLoader] = None,
+    output_dir: Path = OUTPUT_DIR,
+) -> None:
+    refine_model.to(DEVICE)
+    ensemble_model.to(DEVICE).eval()
+    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+
+    best_dice = -1.0
+    for ep in range(1, cfg.epochs + 1):
+        refine_model.train()
+        run_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                p1 = normalize_segmentation_output(ensemble_model(x), ref_shape=y.shape[2:])
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                ref_input = torch.cat([x, p1], dim=1)
+                p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p2, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            class _RefineWrap(nn.Module):
+                def __init__(self, ens: nn.Module, ref: nn.Module):
+                    super().__init__()
+                    self.ens = ens
+                    self.ref = ref
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    p1 = normalize_segmentation_output(self.ens(x), ref_shape=x.shape[2:])
+                    return normalize_segmentation_output(self.ref(torch.cat([x, p1], dim=1)), ref_shape=x.shape[2:])
+            wrapped = _RefineWrap(ensemble_model, refine_model).to(DEVICE)
+            metrics = evaluate_model(wrapped, val_loader, DEVICE, threshold=0.5)
+            print(f"[Refine] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(refine_model, "refinement_best", output_dir=output_dir)
+
+
+def train_single_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    model_name: str = "Model",
+    val_loader: Optional[DataLoader] = None,
+    output_dir: Path = OUTPUT_DIR,
+) -> None:
+    """Uniform base-model fine-tuning loop used for fair comparison."""
+    model.to(DEVICE)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+    best_dice = -1.0
+    for ep in range(1, cfg.epochs + 1):
+        run_loss = 0.0
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            print(f"[{model_name}] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+
+
+def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / f"{name.lower().replace('+', 'plus').replace(' ', '_')}.pth"
+    torch.save(model.state_dict(), ckpt_path)
+    return ckpt_path
+
+
+def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hp_df = pd.DataFrame([params])
+    out = output_dir / "run_hyperparameters.csv"
+    hp_df.to_csv(out, index=False)
+    return out
 
 
 def train_refinement_model(
@@ -1224,28 +1337,24 @@ def run_full_pipeline() -> None:
     Execute full HAR pipeline using environment variables.
 
     Required:
-      DATA_DIR, RESUNET_REPO, RESUNET_CKPT, TRANSFUSE_CKPT
+      DATA_DIR, RESUNET_REPO
     Optional:
-      WDFF_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, FINETUNE_SIZE, NUM_WORKERS
+      RESUNET_CKPT, WDFF_CKPT, TRANSFUSE_CKPT, USE_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, FINETUNE_SIZE, NUM_WORKERS
     """
     mount_drive_if_needed()
 
     data_dir = _must_exist(_auto_prepare_data_dir(), "DATA_DIR")
     resunet_repo = _must_exist(_auto_prepare_resunet_repo(), "RESUNET_REPO")
-    resunet_ckpt = _must_exist(_env_path("RESUNET_CKPT"), "RESUNET_CKPT")
-    transfuse_ckpt = _must_exist(_env_path("TRANSFUSE_CKPT"), "TRANSFUSE_CKPT")
+    resunet_ckpt = _env_path("RESUNET_CKPT")
+    transfuse_ckpt = _env_path("TRANSFUSE_CKPT")
     wdff_ckpt = _env_path("WDFF_CKPT")
-    if wdff_ckpt and not os.path.exists(wdff_ckpt):
-        print(f"[WARN] WDFF_CKPT not found: {wdff_ckpt}. WDFFNet will run with random weights.")
-        wdff_ckpt = None
+    use_ckpt = os.environ.get("USE_CKPT", "0") == "1"
 
     missing = [
         name
         for name, value in [
             ("DATA_DIR", data_dir),
             ("RESUNET_REPO", resunet_repo),
-            ("RESUNET_CKPT", resunet_ckpt),
-            ("TRANSFUSE_CKPT", transfuse_ckpt),
         ]
         if value is None
     ]
@@ -1286,9 +1395,16 @@ def run_full_pipeline() -> None:
     wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
     transfuse = TransFuseSimple(num_classes=1, pretrained=False, transfuse_input_size=224).to(DEVICE)
 
-    load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
-    load_partial_state_dict(wdffnet, wdff_ckpt or "", DEVICE)
-    load_partial_state_dict(transfuse, transfuse_ckpt, DEVICE)
+    if use_ckpt:
+        if resunet_ckpt and os.path.exists(resunet_ckpt):
+            load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
+        if wdff_ckpt and os.path.exists(wdff_ckpt):
+            load_partial_state_dict(wdffnet, wdff_ckpt, DEVICE)
+        if transfuse_ckpt and os.path.exists(transfuse_ckpt):
+            load_partial_state_dict(transfuse, transfuse_ckpt, DEVICE)
+        print("[INFO] USE_CKPT=1 -> loaded available checkpoints.")
+    else:
+        print("[INFO] Training from scratch (USE_CKPT=0).")
 
     train_loader, val_loader = make_loaders(
         data_dir,
@@ -1305,19 +1421,37 @@ def run_full_pipeline() -> None:
     )
     # 1) Uniform base-model training before ensemble training.
     if base_epochs > 0:
-        train_single_model(resunetpp, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="ResUNet++")
-        train_single_model(transfuse, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="TransFuse")
-        train_single_model(wdffnet, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="WDFFNet")
+        train_single_model(
+            resunetpp, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="ResUNet++", val_loader=val_loader, output_dir=output_dir
+        )
+        train_single_model(
+            transfuse, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="TransFuse", val_loader=val_loader, output_dir=output_dir
+        )
+        train_single_model(
+            wdffnet, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="WDFFNet", val_loader=val_loader, output_dir=output_dir
+        )
 
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
     # 2) Ensemble training.
-    train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
+    train_har_head(
+        har, train_loader, TrainConfig(epochs=epochs, lr=1e-3),
+        val_loader=val_loader, model_name="har_ensemble", output_dir=output_dir
+    )
     if finetune_size > img_size:
-        train_har_head(har, train_loader_ft, TrainConfig(epochs=max(2, epochs // 3), lr=5e-4))
+        train_har_head(
+            har, train_loader_ft, TrainConfig(epochs=max(2, epochs // 3), lr=5e-4),
+            val_loader=val_loader_ft, model_name="har_ensemble_finetune", output_dir=output_dir
+        )
 
     # 3) Refinement training.
     refine_model = RefinementModel().to(DEVICE)
-    train_refinement_model(refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4))
+    train_refinement_model(
+        refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4),
+        val_loader=val_loader_ft, output_dir=output_dir
+    )
 
     class CascadeWrapper(nn.Module):
         def __init__(self, ens: nn.Module, ref: nn.Module):
@@ -1423,6 +1557,9 @@ if __name__ == "__main__":
             "  %env RESUNET_REPO=/content/ResUNetPlusPlus\n"
             "  # optional for auto-clone:\n"
             "  %env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git\n"
+            "  # train from scratch by default:\n"
+            "  %env USE_CKPT=0\n"
+            "  # if you want to warm-start, set USE_CKPT=1 and provide paths below:\n"
             "  %env RESUNET_CKPT=/content/drive/MyDrive/.../best_resunetpp_model.pth\n"
             "  %env WDFF_CKPT=/content/drive/MyDrive/.../best_wdffnet.pth\n"
             "  %env TRANSFUSE_CKPT=/content/drive/MyDrive/.../best_transfuse_model.pth\n"

@@ -830,6 +830,48 @@ def train_refinement_model(
         print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
 
 
+def train_single_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    model_name: str = "Model",
+) -> None:
+    """Uniform base-model fine-tuning loop used for fair comparison."""
+    model.to(DEVICE)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+    for ep in range(1, cfg.epochs + 1):
+        run_loss = 0.0
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
+
+
+def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / f"{name.lower().replace('+', 'plus').replace(' ', '_')}.pth"
+    torch.save(model.state_dict(), ckpt_path)
+    return ckpt_path
+
+
+def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hp_df = pd.DataFrame([params])
+    out = output_dir / "run_hyperparameters.csv"
+    hp_df.to_csv(out, index=False)
+    return out
+
+
 # =========================
 # Cell 9: End-to-end run
 # =========================
@@ -1080,6 +1122,74 @@ def analyze_models_on_images(
 
 
 @torch.no_grad()
+def save_loader_comparison_sheet(
+    models: Dict[str, nn.Module],
+    loader: DataLoader,
+    output_file: str = "all_models_visual_comparison.png",
+    output_dir: Path = OUTPUT_DIR,
+    num_samples: int = 6,
+    threshold: float = 0.5,
+) -> Path:
+    """
+    Save a single image sheet with Image + GT + all model masks for easy visual comparison.
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for m in models.values():
+        m.to(DEVICE).eval()
+
+    cols = ["Image", "GT"] + list(models.keys())
+    ncols = len(cols)
+    nrows = num_samples
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.5 * nrows))
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    written = 0
+    for x, y in loader:
+        x = x.to(DEVICE)
+        y_np = y.numpy()
+        preds_by_model: Dict[str, np.ndarray] = {}
+        for name, model in models.items():
+            pred = tta_predict(model, x) if "HAR" in name else multi_scale_predict(model, x)
+            preds_by_model[name] = pred.detach().cpu().numpy()
+
+        for bi in range(x.size(0)):
+            if written >= num_samples:
+                break
+            img = x[bi].detach().cpu().permute(1, 2, 0).numpy()
+            img = (img * np.array(IMAGENET_STD) + np.array(IMAGENET_MEAN)).clip(0, 1)
+            gt = y_np[bi, 0]
+
+            axes[written, 0].imshow(img)
+            axes[written, 0].set_title("Image")
+            axes[written, 1].imshow(gt, cmap="gray")
+            axes[written, 1].set_title("GT")
+            axes[written, 0].axis("off")
+            axes[written, 1].axis("off")
+
+            ci = 2
+            for name in models.keys():
+                mask = (preds_by_model[name][bi, 0] > threshold).astype(np.uint8)
+                mask = post_process_mask(mask)
+                axes[written, ci].imshow(mask, cmap="gray")
+                axes[written, ci].set_title(name)
+                axes[written, ci].axis("off")
+                ci += 1
+            written += 1
+        if written >= num_samples:
+            break
+
+    fig.tight_layout()
+    out = output_dir / output_file
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] loader comparison sheet: {out}")
+    return out
+
+
+@torch.no_grad()
 def estimate_fps(model: nn.Module, loader: DataLoader, warmup: int = 3, measured_batches: int = 10) -> float:
     model.eval()
     iterator = iter(loader)
@@ -1150,10 +1260,26 @@ def run_full_pipeline() -> None:
         )
 
     epochs = int(os.environ.get("EPOCHS", "12"))
+    base_epochs = int(os.environ.get("BASE_EPOCHS", "2"))
     batch_size = int(os.environ.get("BATCH_SIZE", "8"))
     img_size = int(os.environ.get("IMG_SIZE", "256"))
     finetune_size = int(os.environ.get("FINETUNE_SIZE", "320"))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
+    output_dir = OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_run_hyperparams(
+        {
+            "epochs": epochs,
+            "base_epochs": base_epochs,
+            "batch_size": batch_size,
+            "img_size": img_size,
+            "finetune_size": finetune_size,
+            "num_workers": num_workers,
+            "device": str(DEVICE),
+            "amp": USE_AMP,
+        },
+        output_dir=output_dir,
+    )
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
     resunetpp = ResUnetPPBuilder().to(DEVICE)
@@ -1177,11 +1303,19 @@ def run_full_pipeline() -> None:
         batch_size=max(1, batch_size // 2),
         num_workers=num_workers,
     )
+    # 1) Uniform base-model training before ensemble training.
+    if base_epochs > 0:
+        train_single_model(resunetpp, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="ResUNet++")
+        train_single_model(transfuse, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="TransFuse")
+        train_single_model(wdffnet, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5), model_name="WDFFNet")
+
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
+    # 2) Ensemble training.
     train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
     if finetune_size > img_size:
         train_har_head(har, train_loader_ft, TrainConfig(epochs=max(2, epochs // 3), lr=5e-4))
 
+    # 3) Refinement training.
     refine_model = RefinementModel().to(DEVICE)
     train_refinement_model(refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4))
 
@@ -1223,6 +1357,8 @@ def run_full_pipeline() -> None:
         fps = estimate_fps(mdl, val_loader_ft)
         rows.append([name, m["Dice"], m["IoU"], params, fps])
         csv_rows.append({"Model": name, "Dice": m["Dice"], "IoU": m["IoU"], "Params(M)": params, "FPS": fps})
+        ckpt = save_model_checkpoint(mdl, name, output_dir=output_dir)
+        print(f"[Saved] {name} checkpoint -> {ckpt}")
 
     print(
         tabulate(
@@ -1232,12 +1368,18 @@ def run_full_pipeline() -> None:
             tablefmt="github",
         )
     )
-    output_dir = OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
     comp_df = pd.DataFrame(csv_rows)
     comp_df.to_csv(output_dir / "comparison_table.csv", index=False)
     plot_metrics(comp_df, output_dir=output_dir)
     visualize_predictions(cascade_model, val_loader_ft, output_dir=output_dir, num_samples=6)
+    save_loader_comparison_sheet(
+        models=base_wrappers,
+        loader=val_loader_ft,
+        output_file="all_models_visual_comparison.png",
+        output_dir=output_dir,
+        num_samples=6,
+        threshold=best_thr,
+    )
     # Optional: compare 1-2 specific images across base models + ensemble in one file.
     # Example:
     #   %env ANALYZE_IMAGES=/content/data/Kvasir-SEG/images/cju0qkwl35piu0993l0dewei2.jpg,/content/data/Kvasir-SEG/images/xxx.jpg

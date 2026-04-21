@@ -913,6 +913,78 @@ def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DI
     return out
 
 
+def train_refinement_model(
+    refine_model: RefinementModel,
+    ensemble_model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+) -> None:
+    refine_model.to(DEVICE)
+    ensemble_model.to(DEVICE).eval()
+    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+
+    for ep in range(1, cfg.epochs + 1):
+        refine_model.train()
+        run_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                p1 = normalize_segmentation_output(ensemble_model(x), ref_shape=y.shape[2:])
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                ref_input = torch.cat([x, p1], dim=1)
+                p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p2, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
+
+
+def train_single_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    model_name: str = "Model",
+) -> None:
+    """Uniform base-model fine-tuning loop used for fair comparison."""
+    model.to(DEVICE)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+    for ep in range(1, cfg.epochs + 1):
+        run_loss = 0.0
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
+
+
+def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / f"{name.lower().replace('+', 'plus').replace(' ', '_')}.pth"
+    torch.save(model.state_dict(), ckpt_path)
+    return ckpt_path
+
+
+def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hp_df = pd.DataFrame([params])
+    out = output_dir / "run_hyperparameters.csv"
+    hp_df.to_csv(out, index=False)
+    return out
+
+
 # =========================
 # Cell 9: End-to-end run
 # =========================

@@ -14,6 +14,7 @@ import os
 import random
 import subprocess
 import importlib.util
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -90,6 +91,7 @@ else:
     DEVICE = torch.device("cpu")
 USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
+OUTPUT_DIR = Path("/content/drive/MyDrive/ensemble_outputs")
 
 
 # =========================
@@ -474,9 +476,17 @@ class HAREnsemble(nn.Module):
 
         self.attn = ChannelSpatialAttention(in_channels=3)
         self.weight_head = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, 1),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 3, 1),
+            nn.Softmax(dim=1),
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(3, 1, kernel_size=7, padding=3),
+            nn.Sigmoid(),
         )
         self._printed_debug = False
 
@@ -498,10 +508,59 @@ class HAREnsemble(nn.Module):
 
         stack = torch.cat([p1, p2, p3], dim=1)
         stack = self.attn(stack)
-        logits = self.weight_head(stack)
-        weights = torch.softmax(logits, dim=1)
-        fused = (weights * stack).sum(dim=1, keepdim=True)
+        weights = self.weight_head(stack)
+        wr, wt, ww = weights[:, 0:1], weights[:, 1:2], weights[:, 2:3]
+        fused = wr * p1 + wt * p3 + ww * p2
+        fused = fused * self.spatial_attention(stack)
         return fused
+
+
+class RefinementModel(nn.Module):
+    """Small UNet-like second stage that refines ensemble predictions."""
+
+    def __init__(self, in_channels: int = 4, base_channels: int = 32):
+        super().__init__()
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, 3, padding=1),
+            nn.BatchNorm2d(base_channels * 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.pool2 = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels * 4, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(base_channels * 4, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.ConvTranspose2d(base_channels * 2, base_channels * 2, 2, stride=2)
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels * 4, base_channels * 2, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, stride=2)
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Conv2d(base_channels, 1, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool1(e1))
+        b = self.bottleneck(self.pool2(e2))
+        d2 = self.dec2(torch.cat([self.up2(b), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return torch.sigmoid(self.head(d1))
 
 
 # =========================
@@ -543,6 +602,24 @@ def _bin(pred: torch.Tensor, th: float = 0.5) -> torch.Tensor:
     return (pred > th).float()
 
 
+def dice_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6) -> float:
+    pred = _bin(pred, threshold).reshape(-1)
+    target = _bin(target).reshape(-1)
+    tp = ((pred == 1) & (target == 1)).sum().item()
+    fp = ((pred == 1) & (target == 0)).sum().item()
+    fn = ((pred == 0) & (target == 1)).sum().item()
+    return float((2 * tp + eps) / (2 * tp + fp + fn + eps))
+
+
+def iou_score(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5, eps: float = 1e-6) -> float:
+    pred = _bin(pred, threshold).reshape(-1)
+    target = _bin(target).reshape(-1)
+    tp = ((pred == 1) & (target == 1)).sum().item()
+    fp = ((pred == 1) & (target == 0)).sum().item()
+    fn = ((pred == 0) & (target == 1)).sum().item()
+    return float((tp + eps) / (tp + fp + fn + eps))
+
+
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float = 0.5) -> Dict[str, float]:
     pred = _bin(pred, th=threshold)
     target = _bin(target)
@@ -554,8 +631,8 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float =
     fn = ((pred_f == 0) & (tar_f == 1)).sum().item()
     tn = ((pred_f == 0) & (tar_f == 0)).sum().item()
 
-    dice = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)
-    iou = (tp + 1e-6) / (tp + fp + fn + 1e-6)
+    dice = dice_score(pred, target, threshold=0.5)
+    iou = iou_score(pred, target, threshold=0.5)
     precision = (tp + 1e-6) / (tp + fp + 1e-6)
     recall = (tp + 1e-6) / (tp + fn + 1e-6)
     f1 = (2 * precision * recall + 1e-6) / (precision + recall + 1e-6)
@@ -564,12 +641,29 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor, threshold: float =
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, threshold: float = 0.5) -> Dict[str, float]:
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+    use_postprocess: bool = False,
+    use_tta: bool = False,
+) -> Dict[str, float]:
     model.eval()
     agg = {"Dice": [], "IoU": [], "Accuracy": [], "Precision": [], "Recall": [], "F1": []}
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        if use_tta:
+            p = tta_predict(model, x)
+        else:
+            p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        if use_postprocess:
+            p_np = p.detach().cpu().numpy()
+            pp = []
+            for bi in range(p_np.shape[0]):
+                proc = post_process_mask((p_np[bi, 0] > threshold).astype(np.uint8))
+                pp.append(torch.from_numpy((proc > 0).astype(np.float32))[None, ...])
+            p = torch.stack(pp, dim=0).to(device)
         batch_metrics = compute_metrics(p, y, threshold=threshold)
         for k, v in batch_metrics.items():
             agg[k].append(v)
@@ -577,17 +671,63 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device, t
 
 
 @torch.no_grad()
-def find_best_threshold(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
-    """Tune binary threshold for best validation Dice."""
-    candidates = np.linspace(0.30, 0.70, 17)
+def collect_preds_and_masks(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_tta: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    preds, masks = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if use_tta:
+            p = tta_predict(model, x)
+        else:
+            p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+        preds.append(p.detach().cpu())
+        masks.append(y.detach().cpu())
+    return torch.cat(preds, dim=0), torch.cat(masks, dim=0)
+
+
+def find_best_threshold(preds: torch.Tensor, masks: torch.Tensor) -> float:
+    """Search thresholds from 0.20 to 0.60 (step 0.05) and pick best Dice."""
+    candidates = np.arange(0.20, 0.61, 0.05)
     best_t, best_dice = 0.5, -1.0
     for t in candidates:
-        m = evaluate_model(model, loader, device, threshold=float(t))
-        if m["Dice"] > best_dice:
-            best_dice = m["Dice"]
+        d = dice_score(preds, masks, threshold=float(t))
+        if d > best_dice:
+            best_dice = d
             best_t = float(t)
     print(f"[HAR] Best validation threshold: {best_t:.2f} (Dice={best_dice:.4f})")
     return best_t
+
+
+def multi_scale_predict(model: nn.Module, img: torch.Tensor, scales: Iterable[float] = (0.75, 1.0, 1.25)) -> torch.Tensor:
+    """Run model at multiple scales and return averaged sigmoid output."""
+    model.eval()
+    _, _, h, w = img.shape
+    preds = []
+    for s in scales:
+        nh = max(16, int(round(h * s)))
+        nw = max(16, int(round(w * s)))
+        scaled = F.interpolate(img, size=(nh, nw), mode="bilinear", align_corners=False)
+        pred = normalize_segmentation_output(model(scaled), ref_shape=(nh, nw))
+        pred = F.interpolate(pred, size=(h, w), mode="bilinear", align_corners=False)
+        preds.append(pred)
+    return torch.mean(torch.stack(preds, dim=0), dim=0)
+
+
+def tta_predict(model: nn.Module, img: torch.Tensor) -> torch.Tensor:
+    """TTA with horizontal/vertical flips, each branch using multi-scale inference."""
+    model.eval()
+    preds = [multi_scale_predict(model, img)]
+    fh = torch.flip(img, dims=[3])
+    preds.append(torch.flip(multi_scale_predict(model, fh), dims=[3]))
+    fv = torch.flip(img, dims=[2])
+    preds.append(torch.flip(multi_scale_predict(model, fv), dims=[2]))
+    return torch.mean(torch.stack(preds, dim=0), dim=0)
 
 
 # =========================
@@ -609,14 +749,45 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
     return 1 - dice.mean()
 
 
-def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfig):
+def focal_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.8, gamma: float = 2.0) -> torch.Tensor:
+    pred = pred.clamp(1e-6, 1 - 1e-6)
+    bce = F.binary_cross_entropy(pred, target, reduction="none")
+    pt = torch.where(target == 1, pred, 1 - pred)
+    return (alpha * (1 - pt) ** gamma * bce).mean()
+
+
+def boundary_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Boundary-aware loss via Laplacian-like gradient mismatch."""
+    kernel = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
+    pred_b = torch.abs(F.conv2d(pred, kernel, padding=1))
+    tar_b = torch.abs(F.conv2d(target, kernel, padding=1))
+    return F.l1_loss(pred_b, tar_b)
+
+
+def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    loss_bce = F.binary_cross_entropy(pred.float(), target.float())
+    loss_dice = dice_loss(pred, target)
+    loss_focal = focal_loss(pred, target)
+    loss_boundary = boundary_loss(pred, target)
+    return 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
+
+
+def train_har_head(
+    model: HAREnsemble,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    val_loader: Optional[DataLoader] = None,
+    model_name: str = "har_ensemble",
+    output_dir: Path = OUTPUT_DIR,
+):
     optimizer = torch.optim.Adam(
-        list(model.attn.parameters()) + list(model.weight_head.parameters()),
+        list(model.attn.parameters()) + list(model.weight_head.parameters()) + list(model.spatial_attention.parameters()),
         lr=cfg.lr,
     )
     scaler = GradScaler("cuda", enabled=USE_AMP)
 
     model.to(DEVICE)
+    best_dice = -1.0
     for ep in range(1, cfg.epochs + 1):
         model.train()
         run_loss = 0.0
@@ -625,16 +796,121 @@ def train_har_head(model: HAREnsemble, train_loader: DataLoader, cfg: TrainConfi
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss_dice = dice_loss(p, y)
-            # BCE is not autocast-safe; run in full precision outside autocast.
-            loss_bce = F.binary_cross_entropy(p.float(), y.float())
-            loss = 0.5 * loss_bce + 0.5 * loss_dice
+                loss = combined_seg_loss(p, y)
+                batch_dice = dice_score(p.detach(), y.detach(), threshold=0.5)
+                if batch_dice < 0.7:
+                    loss = loss * 1.5
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             run_loss += loss.item()
         print(f"Epoch {ep}/{cfg.epochs} | HAR head loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            print(f"[HAR] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+
+
+def train_refinement_model(
+    refine_model: RefinementModel,
+    ensemble_model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    val_loader: Optional[DataLoader] = None,
+    output_dir: Path = OUTPUT_DIR,
+) -> None:
+    refine_model.to(DEVICE)
+    ensemble_model.to(DEVICE).eval()
+    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+
+    best_dice = -1.0
+    for ep in range(1, cfg.epochs + 1):
+        refine_model.train()
+        run_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.no_grad():
+                p1 = normalize_segmentation_output(ensemble_model(x), ref_shape=y.shape[2:])
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                ref_input = torch.cat([x, p1], dim=1)
+                p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p2, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            class _RefineWrap(nn.Module):
+                def __init__(self, ens: nn.Module, ref: nn.Module):
+                    super().__init__()
+                    self.ens = ens
+                    self.ref = ref
+                def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    p1 = normalize_segmentation_output(self.ens(x), ref_shape=x.shape[2:])
+                    return normalize_segmentation_output(self.ref(torch.cat([x, p1], dim=1)), ref_shape=x.shape[2:])
+            wrapped = _RefineWrap(ensemble_model, refine_model).to(DEVICE)
+            metrics = evaluate_model(wrapped, val_loader, DEVICE, threshold=0.5)
+            print(f"[Refine] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(refine_model, "refinement_best", output_dir=output_dir)
+
+
+def train_single_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    cfg: TrainConfig,
+    model_name: str = "Model",
+    val_loader: Optional[DataLoader] = None,
+    output_dir: Path = OUTPUT_DIR,
+) -> None:
+    """Uniform base-model fine-tuning loop used for fair comparison."""
+    model.to(DEVICE)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = GradScaler("cuda", enabled=USE_AMP)
+    best_dice = -1.0
+    for ep in range(1, cfg.epochs + 1):
+        run_loss = 0.0
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(device_type="cuda", enabled=USE_AMP):
+                p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
+                loss = combined_seg_loss(p, y)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            run_loss += loss.item()
+        print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
+        if val_loader is not None:
+            metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            print(f"[{model_name}] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
+            if metrics["Dice"] > best_dice:
+                best_dice = metrics["Dice"]
+                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+
+
+def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = output_dir / f"{name.lower().replace('+', 'plus').replace(' ', '_')}.pth"
+    torch.save(model.state_dict(), ckpt_path)
+    return ckpt_path
+
+
+def save_run_hyperparams(params: Dict[str, object], output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    hp_df = pd.DataFrame([params])
+    out = output_dir / "run_hyperparameters.csv"
+    hp_df.to_csv(out, index=False)
+    return out
 
 
 # =========================
@@ -690,6 +966,63 @@ def _must_exist(path: Optional[str], label: str) -> Optional[str]:
     return path
 
 
+def _auto_prepare_data_dir() -> Optional[str]:
+    """
+    Resolve dataset path more robustly for Colab.
+    Priority:
+      1) DATA_DIR if exists
+      2) Extract DATA_ZIP (if provided) to /content/data/
+      3) Check common Colab/Drive fallback locations
+    """
+    data_dir = _env_path("DATA_DIR")
+    if data_dir and os.path.exists(data_dir):
+        return data_dir
+
+    data_zip = _env_path("DATA_ZIP")
+    if data_zip and os.path.exists(data_zip):
+        target_root = Path("/content/data")
+        target_root.mkdir(parents=True, exist_ok=True)
+        print(f"[INFO] Extracting dataset zip: {data_zip} -> {target_root}")
+        subprocess.run(["unzip", "-o", data_zip, "-d", str(target_root)], check=True)
+        # Try common extracted folder names.
+        candidates = [
+            target_root / "Kvasir-SEG",
+            target_root / "kvasir-seg",
+            target_root / "Kvasir_SEG",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+
+    fallback_candidates = [
+        "/content/data/Kvasir-SEG",
+        "/content/Kvasir-SEG",
+        "/content/drive/MyDrive/Kvasir-SEG",
+        "/content/drive/MyDrive/data/Kvasir-SEG",
+    ]
+    for c in fallback_candidates:
+        if os.path.exists(c):
+            print(f"[INFO] Using fallback DATA_DIR: {c}")
+            return c
+    return None
+
+
+def _auto_prepare_resunet_repo() -> Optional[str]:
+    """Resolve or optionally clone ResUNet++ repository in Colab."""
+    repo = _env_path("RESUNET_REPO")
+    if repo and os.path.exists(repo):
+        return repo
+
+    repo_url = _env_path("RESUNET_REPO_URL") or "https://github.com/DebeshJha/ResUNetPlusPlus.git"
+    default_repo = Path("/content/ResUNetPlusPlus")
+    if not default_repo.exists():
+        print(f"[INFO] Cloning ResUNet++ repo from: {repo_url}")
+        clone_repo_if_needed(repo_url, str(default_repo))
+    if default_repo.exists():
+        return str(default_repo)
+    return None
+
+
 def mount_drive_if_needed() -> None:
     """Mount Google Drive only when running inside Colab and not already mounted."""
     in_colab = importlib.util.find_spec("google.colab") is not None
@@ -702,33 +1035,254 @@ def mount_drive_if_needed() -> None:
         drive.mount("/content/drive")
 
 
+def post_process_mask(mask: np.ndarray, min_area: int = 100) -> np.ndarray:
+    """Median blur + closing + small component removal."""
+    mask_u8 = (mask > 0).astype(np.uint8) * 255
+    mask_u8 = cv2.medianBlur(mask_u8, 5)
+    kernel = np.ones((5, 5), np.uint8)
+    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    cleaned = np.zeros_like(mask_u8)
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            cleaned[labels == i] = 255
+    return cleaned
+
+
+def save_plot(fig, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / name
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    return path
+
+
+def visualize_predictions(model: nn.Module, loader: DataLoader, output_dir: Path = OUTPUT_DIR, num_samples: int = 4) -> None:
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    shown = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(DEVICE)
+            pred = tta_predict(model, x)
+            for bi in range(x.size(0)):
+                if shown >= num_samples:
+                    return
+                img = x[bi].detach().cpu().permute(1, 2, 0).numpy()
+                img = (img * np.array(IMAGENET_STD) + np.array(IMAGENET_MEAN)).clip(0, 1)
+                gt = y[bi, 0].detach().cpu().numpy()
+                pr = (pred[bi, 0].detach().cpu().numpy() > 0.5).astype(np.uint8)
+                pr = post_process_mask(pr)
+
+                fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+                axes[0].imshow(img)
+                axes[0].set_title("Image")
+                axes[1].imshow(gt, cmap="gray")
+                axes[1].set_title("GT")
+                axes[2].imshow(pr, cmap="gray")
+                axes[2].set_title("Pred")
+                for ax in axes:
+                    ax.axis("off")
+                save_plot(fig, f"prediction_{shown:03d}.png", output_dir=output_dir)
+                plt.close(fig)
+                shown += 1
+
+
+def plot_metrics(df: pd.DataFrame, output_dir: Path = OUTPUT_DIR) -> None:
+    import matplotlib.pyplot as plt
+
+    for metric in ["Dice", "IoU"]:
+        fig = plt.figure(figsize=(8, 4))
+        plt.plot(df["Model"], df[metric], marker="o")
+        plt.xticks(rotation=20, ha="right")
+        plt.ylabel(metric)
+        plt.grid(alpha=0.3)
+        plt.title(f"{metric} Comparison")
+        save_plot(fig, f"{metric.lower()}_plot.png", output_dir=output_dir)
+        plt.close(fig)
+
+
+@torch.no_grad()
+def analyze_models_on_images(
+    models: Dict[str, nn.Module],
+    image_paths: List[str],
+    output_file: str = "model_comparison_samples.png",
+    output_dir: Path = OUTPUT_DIR,
+    image_size: int = 320,
+    threshold: float = 0.5,
+) -> Path:
+    """
+    Analyze 1-2 images with ResUNet++, TransFuse, WDFFNet, and Ensemble in one file.
+    Produces a single comparison sheet: rows=samples, cols=[Image, each model prediction].
+    """
+    import matplotlib.pyplot as plt
+
+    if not image_paths:
+        raise ValueError("image_paths cannot be empty.")
+    image_paths = image_paths[:2]  # user requested one or two samples
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_names = list(models.keys())
+    for m in models.values():
+        m.to(DEVICE).eval()
+
+    tf = A.Compose([A.Resize(image_size, image_size), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
+    nrows = len(image_paths)
+    ncols = 1 + len(model_names)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for r, img_path in enumerate(image_paths):
+        rgb = cv2.cvtColor(cv2.imread(img_path), cv2.COLOR_BGR2RGB)
+        aug = tf(image=rgb)
+        x_np = aug["image"].astype("float32").transpose(2, 0, 1)
+        x = torch.from_numpy(x_np).unsqueeze(0).to(DEVICE)
+
+        axes[r, 0].imshow(rgb)
+        axes[r, 0].set_title(f"Input #{r + 1}")
+        axes[r, 0].axis("off")
+
+        for c, model_name in enumerate(model_names, start=1):
+            model = models[model_name]
+            pred = tta_predict(model, x) if model_name.lower().startswith("har") else multi_scale_predict(model, x)
+            pred_np = pred[0, 0].detach().cpu().numpy()
+            mask = (pred_np > threshold).astype(np.uint8)
+            mask = post_process_mask(mask)
+            axes[r, c].imshow(mask, cmap="gray")
+            axes[r, c].set_title(model_name)
+            axes[r, c].axis("off")
+
+    fig.tight_layout()
+    out_path = output_dir / output_file
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] model comparison sheet: {out_path}")
+    return out_path
+
+
+@torch.no_grad()
+def save_loader_comparison_sheet(
+    models: Dict[str, nn.Module],
+    loader: DataLoader,
+    output_file: str = "all_models_visual_comparison.png",
+    output_dir: Path = OUTPUT_DIR,
+    num_samples: int = 6,
+    threshold: float = 0.5,
+) -> Path:
+    """
+    Save a single image sheet with Image + GT + all model masks for easy visual comparison.
+    """
+    import matplotlib.pyplot as plt
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for m in models.values():
+        m.to(DEVICE).eval()
+
+    cols = ["Image", "GT"] + list(models.keys())
+    ncols = len(cols)
+    nrows = num_samples
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.5 * nrows))
+    if nrows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    written = 0
+    for x, y in loader:
+        x = x.to(DEVICE)
+        y_np = y.numpy()
+        preds_by_model: Dict[str, np.ndarray] = {}
+        for name, model in models.items():
+            pred = tta_predict(model, x) if "HAR" in name else multi_scale_predict(model, x)
+            preds_by_model[name] = pred.detach().cpu().numpy()
+
+        for bi in range(x.size(0)):
+            if written >= num_samples:
+                break
+            img = x[bi].detach().cpu().permute(1, 2, 0).numpy()
+            img = (img * np.array(IMAGENET_STD) + np.array(IMAGENET_MEAN)).clip(0, 1)
+            gt = y_np[bi, 0]
+
+            axes[written, 0].imshow(img)
+            axes[written, 0].set_title("Image")
+            axes[written, 1].imshow(gt, cmap="gray")
+            axes[written, 1].set_title("GT")
+            axes[written, 0].axis("off")
+            axes[written, 1].axis("off")
+
+            ci = 2
+            for name in models.keys():
+                mask = (preds_by_model[name][bi, 0] > threshold).astype(np.uint8)
+                mask = post_process_mask(mask)
+                axes[written, ci].imshow(mask, cmap="gray")
+                axes[written, ci].set_title(name)
+                axes[written, ci].axis("off")
+                ci += 1
+            written += 1
+        if written >= num_samples:
+            break
+
+    fig.tight_layout()
+    out = output_dir / output_file
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Saved] loader comparison sheet: {out}")
+    return out
+
+
+@torch.no_grad()
+def estimate_fps(model: nn.Module, loader: DataLoader, warmup: int = 3, measured_batches: int = 10) -> float:
+    model.eval()
+    iterator = iter(loader)
+    for _ in range(warmup):
+        try:
+            x, _ = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            x, _ = next(iterator)
+        _ = model(x.to(DEVICE))
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+    seen = 0
+    start = time.time()
+    for _ in range(measured_batches):
+        try:
+            x, _ = next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            x, _ = next(iterator)
+        _ = model(x.to(DEVICE))
+        seen += x.size(0)
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+    elapsed = max(1e-6, time.time() - start)
+    return seen / elapsed
+
+
 def run_full_pipeline() -> None:
     """
     Execute full HAR pipeline using environment variables.
 
     Required:
-      DATA_DIR, RESUNET_REPO, RESUNET_CKPT, TRANSFUSE_CKPT
+      DATA_DIR, RESUNET_REPO
     Optional:
-      WDFF_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, NUM_WORKERS
+      RESUNET_CKPT, WDFF_CKPT, TRANSFUSE_CKPT, USE_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, FINETUNE_SIZE, NUM_WORKERS
     """
     mount_drive_if_needed()
 
-    data_dir = _must_exist(_env_path("DATA_DIR"), "DATA_DIR")
-    resunet_repo = _must_exist(_env_path("RESUNET_REPO"), "RESUNET_REPO")
-    resunet_ckpt = _must_exist(_env_path("RESUNET_CKPT"), "RESUNET_CKPT")
-    transfuse_ckpt = _must_exist(_env_path("TRANSFUSE_CKPT"), "TRANSFUSE_CKPT")
+    data_dir = _must_exist(_auto_prepare_data_dir(), "DATA_DIR")
+    resunet_repo = _must_exist(_auto_prepare_resunet_repo(), "RESUNET_REPO")
+    resunet_ckpt = _env_path("RESUNET_CKPT")
+    transfuse_ckpt = _env_path("TRANSFUSE_CKPT")
     wdff_ckpt = _env_path("WDFF_CKPT")
-    if wdff_ckpt and not os.path.exists(wdff_ckpt):
-        print(f"[WARN] WDFF_CKPT not found: {wdff_ckpt}. WDFFNet will run with random weights.")
-        wdff_ckpt = None
+    use_ckpt = os.environ.get("USE_CKPT", "0") == "1"
 
     missing = [
         name
         for name, value in [
             ("DATA_DIR", data_dir),
             ("RESUNET_REPO", resunet_repo),
-            ("RESUNET_CKPT", resunet_ckpt),
-            ("TRANSFUSE_CKPT", transfuse_ckpt),
         ]
         if value is None
     ]
@@ -736,22 +1290,53 @@ def run_full_pipeline() -> None:
         raise ValueError(
             "Missing required environment variables: "
             + ", ".join(missing)
-            + ".\nSet them before running `%run colab_har_ensemble.py`."
+            + ".\nSet them before running `%run colab_har_ensemble.py`.\n"
+            + "Tips:\n"
+            + "  - Set DATA_DIR directly, or set DATA_ZIP to a zip path in Drive.\n"
+            + "  - Set RESUNET_REPO directly, or optionally set RESUNET_REPO_URL for auto-clone."
         )
 
     epochs = int(os.environ.get("EPOCHS", "12"))
+    base_epochs = int(os.environ.get("BASE_EPOCHS", "2"))
     batch_size = int(os.environ.get("BATCH_SIZE", "8"))
-    img_size = int(os.environ.get("IMG_SIZE", "352"))
+    img_size = int(os.environ.get("IMG_SIZE", "320"))
+    finetune_size = int(os.environ.get("FINETUNE_SIZE", str(img_size)))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
+    output_dir = OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    save_run_hyperparams(
+        {
+            "epochs": epochs,
+            "base_epochs": base_epochs,
+            "batch_size": batch_size,
+            "img_size": img_size,
+            "finetune_size": finetune_size,
+            "num_workers": num_workers,
+            "device": str(DEVICE),
+            "amp": USE_AMP,
+        },
+        output_dir=output_dir,
+    )
+    print(
+        f"[INFO] Uniform setup -> IMG_SIZE={img_size}, FINETUNE_SIZE={finetune_size}, "
+        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}"
+    )
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
     resunetpp = ResUnetPPBuilder().to(DEVICE)
     wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
     transfuse = TransFuseSimple(num_classes=1, pretrained=False, transfuse_input_size=224).to(DEVICE)
 
-    load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
-    load_partial_state_dict(wdffnet, wdff_ckpt or "", DEVICE)
-    load_partial_state_dict(transfuse, transfuse_ckpt, DEVICE)
+    if use_ckpt:
+        if resunet_ckpt and os.path.exists(resunet_ckpt):
+            load_partial_state_dict(resunetpp, resunet_ckpt, DEVICE)
+        if wdff_ckpt and os.path.exists(wdff_ckpt):
+            load_partial_state_dict(wdffnet, wdff_ckpt, DEVICE)
+        if transfuse_ckpt and os.path.exists(transfuse_ckpt):
+            load_partial_state_dict(transfuse, transfuse_ckpt, DEVICE)
+        print("[INFO] USE_CKPT=1 -> loaded available checkpoints.")
+    else:
+        print("[INFO] Training from scratch (USE_CKPT=0).")
 
     train_loader, val_loader = make_loaders(
         data_dir,
@@ -759,31 +1344,131 @@ def run_full_pipeline() -> None:
         batch_size=batch_size,
         num_workers=num_workers,
     )
+    # Uniform loader setup by default (same resolution for base/ensemble/refinement).
+    if finetune_size == img_size:
+        train_loader_ft, val_loader_ft = train_loader, val_loader
+    else:
+        train_loader_ft, val_loader_ft = make_loaders(
+            data_dir,
+            size=finetune_size,
+            batch_size=max(1, batch_size // 2),
+            num_workers=num_workers,
+        )
+    # 1) Uniform base-model training before ensemble training.
+    if base_epochs > 0:
+        train_single_model(
+            resunetpp, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="ResUNet++", val_loader=val_loader, output_dir=output_dir
+        )
+        train_single_model(
+            transfuse, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="TransFuse", val_loader=val_loader, output_dir=output_dir
+        )
+        train_single_model(
+            wdffnet, train_loader, TrainConfig(epochs=base_epochs, lr=8e-5),
+            model_name="WDFFNet", val_loader=val_loader, output_dir=output_dir
+        )
+
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
-    train_har_head(har, train_loader, TrainConfig(epochs=epochs, lr=1e-3))
-    best_thr = find_best_threshold(har, val_loader, DEVICE)
+    # 2) Ensemble training.
+    train_har_head(
+        har, train_loader, TrainConfig(epochs=epochs, lr=1e-3),
+        val_loader=val_loader, model_name="har_ensemble", output_dir=output_dir
+    )
+    if finetune_size > img_size:
+        train_har_head(
+            har, train_loader_ft, TrainConfig(epochs=max(2, epochs // 3), lr=5e-4),
+            val_loader=val_loader_ft, model_name="har_ensemble_finetune", output_dir=output_dir
+        )
+
+    # 3) Refinement training.
+    refine_model = RefinementModel().to(DEVICE)
+    train_refinement_model(
+        refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4),
+        val_loader=val_loader_ft, output_dir=output_dir
+    )
+
+    class CascadeWrapper(nn.Module):
+        def __init__(self, ens: nn.Module, ref: nn.Module):
+            super().__init__()
+            self.ens = ens
+            self.ref = ref
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            p1 = normalize_segmentation_output(self.ens(x), ref_shape=x.shape[2:])
+            p2 = self.ref(torch.cat([x, p1], dim=1))
+            return normalize_segmentation_output(p2, ref_shape=x.shape[2:])
+
+    cascade_model = CascadeWrapper(har, refine_model).to(DEVICE)
+    val_preds, val_masks = collect_preds_and_masks(cascade_model, val_loader_ft, DEVICE, use_tta=True)
+    best_thr = find_best_threshold(val_preds, val_masks)
 
     base_wrappers = {
         "ResUNet++": resunetpp,
         "WDFFNet": wdffnet,
         "TransFuse": transfuse,
         "HAR Ensemble": har,
+        "HAR+Refine": cascade_model,
     }
 
-    rows = []
+    rows, csv_rows = [], []
     for name, mdl in base_wrappers.items():
-        threshold = best_thr if name == "HAR Ensemble" else 0.5
-        m = evaluate_model(mdl, val_loader, DEVICE, threshold=threshold)
-        rows.append([name, m["Dice"], m["IoU"], m["Accuracy"], m["Precision"], m["Recall"], m["F1"]])
+        threshold = best_thr if name in ("HAR Ensemble", "HAR+Refine") else 0.5
+        m = evaluate_model(
+            mdl,
+            val_loader_ft,
+            DEVICE,
+            threshold=threshold,
+            use_postprocess=(name == "HAR+Refine"),
+            use_tta=(name == "HAR+Refine"),
+        )
+        params = sum(p.numel() for p in mdl.parameters()) / 1e6
+        fps = estimate_fps(mdl, val_loader_ft)
+        rows.append([name, m["Dice"], m["IoU"], params, fps])
+        csv_rows.append({"Model": name, "Dice": m["Dice"], "IoU": m["IoU"], "Params(M)": params, "FPS": fps})
+        ckpt = save_model_checkpoint(mdl, name, output_dir=output_dir)
+        print(f"[Saved] {name} checkpoint -> {ckpt}")
 
     print(
         tabulate(
             rows,
-            headers=["Model", "Dice", "IoU", "Accuracy", "Precision", "Recall", "F1"],
+            headers=["Model", "Dice", "IoU", "Params(M)", "FPS"],
             floatfmt=".4f",
             tablefmt="github",
         )
     )
+    comp_df = pd.DataFrame(csv_rows)
+    comp_df.to_csv(output_dir / "comparison_table.csv", index=False)
+    plot_metrics(comp_df, output_dir=output_dir)
+    visualize_predictions(cascade_model, val_loader_ft, output_dir=output_dir, num_samples=6)
+    save_loader_comparison_sheet(
+        models=base_wrappers,
+        loader=val_loader_ft,
+        output_file="all_models_visual_comparison.png",
+        output_dir=output_dir,
+        num_samples=6,
+        threshold=best_thr,
+    )
+    # Optional: compare 1-2 specific images across base models + ensemble in one file.
+    # Example:
+    #   %env ANALYZE_IMAGES=/content/data/Kvasir-SEG/images/cju0qkwl35piu0993l0dewei2.jpg,/content/data/Kvasir-SEG/images/xxx.jpg
+    analyze_images = os.environ.get("ANALYZE_IMAGES", "").strip()
+    if analyze_images:
+        selected = [p.strip() for p in analyze_images.split(",") if p.strip() and os.path.exists(p.strip())][:2]
+        if selected:
+            analyze_models_on_images(
+                models={
+                    "ResUNet++": resunetpp,
+                    "TransFuse": transfuse,
+                    "WDFFNet": wdffnet,
+                    "HAR Ensemble": har,
+                },
+                image_paths=selected,
+                output_file="studied_models_comparison.png",
+                output_dir=output_dir,
+                image_size=finetune_size,
+                threshold=best_thr,
+            )
 
 
 if __name__ == "__main__":
@@ -802,9 +1487,14 @@ if __name__ == "__main__":
         print(
             "[INFO] To run in Colab, set env vars first:\n"
             "  %env DATA_DIR=/content/data/Kvasir-SEG\n"
+            "  # or provide zipped dataset:\n"
+            "  %env DATA_ZIP=/content/drive/MyDrive/datasets/Kvasir-SEG.zip\n"
             "  %env RESUNET_REPO=/content/ResUNetPlusPlus\n"
-            "  %env RESUNET_CKPT=/content/drive/MyDrive/.../best_resunetpp_model.pth\n"
-            "  %env WDFF_CKPT=/content/drive/MyDrive/.../best_wdffnet.pth\n"
-            "  %env TRANSFUSE_CKPT=/content/drive/MyDrive/.../best_transfuse_model.pth\n"
+            "  # optional for auto-clone:\n"
+            "  %env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git\n"
+            "  # train from scratch (recommended):\n"
+            "  %env USE_CKPT=0\n"
+            "  %env IMG_SIZE=320\n"
+            "  %env FINETUNE_SIZE=320\n"
             "  %run colab_har_ensemble.py"
         )

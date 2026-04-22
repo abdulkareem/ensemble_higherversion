@@ -91,6 +91,7 @@ if CUDA_OK:
 else:
     DEVICE = torch.device("cpu")
 USE_AMP = DEVICE.type == "cuda" and os.environ.get("DISABLE_AMP", "0") != "1"
+HIGH_PERF = os.environ.get("HIGH_PERF", "0") == "1"
 print(f"Device: {DEVICE} | AMP: {USE_AMP}")
 OUTPUT_DIR = Path("/content/drive/MyDrive/ensemble_outputs")
 
@@ -375,13 +376,32 @@ class KvasirDataset(Dataset):
     def __init__(self, df: pd.DataFrame, size: int = 352, augment: bool = False):
         self.df = df.reset_index(drop=True)
         if augment:
-            self.tf = A.Compose([
-                A.Resize(size, size),
-                A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.2),
-                A.RandomRotate90(p=0.2),
-                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-            ])
+            if HIGH_PERF:
+                self.tf = A.Compose([
+                    A.Resize(size, size),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.3),
+                    A.RandomRotate90(p=0.4),
+                    A.ShiftScaleRotate(
+                        shift_limit=0.05,
+                        scale_limit=0.15,
+                        rotate_limit=20,
+                        p=0.6,
+                        border_mode=cv2.BORDER_REFLECT,
+                    ),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                    A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=8, p=0.3),
+                    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                    A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                ])
+            else:
+                self.tf = A.Compose([
+                    A.Resize(size, size),
+                    A.HorizontalFlip(p=0.5),
+                    A.VerticalFlip(p=0.2),
+                    A.RandomRotate90(p=0.2),
+                    A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+                ])
         else:
             self.tf = A.Compose([A.Resize(size, size), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)])
 
@@ -695,8 +715,8 @@ def collect_preds_and_masks(
 
 
 def find_best_threshold(preds: torch.Tensor, masks: torch.Tensor) -> float:
-    """Search thresholds from 0.20 to 0.60 (step 0.05) and pick best Dice."""
-    candidates = np.arange(0.20, 0.61, 0.05)
+    """Search thresholds and pick best Dice."""
+    candidates = np.arange(0.10, 0.91, 0.01) if HIGH_PERF else np.arange(0.20, 0.61, 0.05)
     best_t, best_dice = 0.5, -1.0
     for t in candidates:
         d = dice_score(preds, masks, threshold=float(t))
@@ -784,7 +804,46 @@ def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     loss_dice = dice_loss(pred, target)
     loss_focal = focal_loss(pred, target)
     loss_boundary = boundary_loss(pred, target)
-    return 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
+    base = 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
+    if not HIGH_PERF:
+        return base
+    # Deep-supervision-style multi-scale regularization.
+    p2 = F.interpolate(pred, scale_factor=0.5, mode="bilinear", align_corners=False)
+    t2 = F.interpolate(target, scale_factor=0.5, mode="nearest")
+    p4 = F.interpolate(pred, scale_factor=0.25, mode="bilinear", align_corners=False)
+    t4 = F.interpolate(target, scale_factor=0.25, mode="nearest")
+    ds = 0.5 * (dice_loss(p2, t2) + bce_from_probs(p2, t2)) + 0.5 * (dice_loss(p4, t4) + bce_from_probs(p4, t4))
+    return base + 0.2 * ds
+
+
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items() if v.dtype.is_floating_point}
+        self.backup: Dict[str, torch.Tensor] = {}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for k, v in model.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module) -> None:
+        self.backup = {}
+        msd = model.state_dict()
+        for k, v in self.shadow.items():
+            self.backup[k] = msd[k].detach().clone()
+            msd[k].copy_(v)
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        if not self.backup:
+            return
+        msd = model.state_dict()
+        for k, v in self.backup.items():
+            msd[k].copy_(v)
+        self.backup = {}
 
 
 def train_har_head(
@@ -794,15 +853,21 @@ def train_har_head(
     val_loader: Optional[DataLoader] = None,
     model_name: str = "har_ensemble",
     output_dir: Path = OUTPUT_DIR,
-):
-    optimizer = torch.optim.Adam(
+)-> Optional[Path]:
+    optimizer = torch.optim.AdamW(
         list(model.attn.parameters()) + list(model.weight_head.parameters()) + list(model.spatial_attention.parameters()),
         lr=cfg.lr,
+        weight_decay=1e-4 if HIGH_PERF else 0.0,
     )
     scaler = GradScaler("cuda", enabled=USE_AMP)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, cfg.epochs * len(train_loader)), eta_min=max(cfg.lr * 0.1, 1e-6)
+    ) if HIGH_PERF else None
+    ema = ModelEMA(model, decay=0.999) if HIGH_PERF else None
 
     model.to(DEVICE)
     best_dice = -1.0
+    best_ckpt: Optional[Path] = None
     for ep in range(1, cfg.epochs + 1):
         model.train()
         run_loss = 0.0
@@ -812,21 +877,34 @@ def train_har_head(
             with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
                 loss = combined_seg_loss(p, y)
-                batch_dice = dice_score(p.detach(), y.detach(), threshold=0.5)
-                if batch_dice < 0.7:
-                    loss = loss * 1.5
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(model.attn.parameters()) + list(model.weight_head.parameters()) + list(model.spatial_attention.parameters()),
+                max_norm=1.0,
+            )
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(model)
             run_loss += loss.item()
         print(f"Epoch {ep}/{cfg.epochs} | HAR head loss: {run_loss / len(train_loader):.4f}")
         if val_loader is not None:
+            if ema is not None:
+                ema.apply_shadow(model)
             metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            if ema is not None:
+                ema.restore(model)
             print(f"[HAR] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
             if metrics["Dice"] > best_dice:
                 best_dice = metrics["Dice"]
-                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+                best_ckpt = save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+    if best_ckpt is not None:
+        model.load_state_dict(torch.load(best_ckpt, map_location=DEVICE))
+        print(f"[HAR] Reloaded best checkpoint: {best_ckpt}")
+    return best_ckpt
 
 
 def train_refinement_model(
@@ -836,13 +914,22 @@ def train_refinement_model(
     cfg: TrainConfig,
     val_loader: Optional[DataLoader] = None,
     output_dir: Path = OUTPUT_DIR,
-) -> None:
+) -> Optional[Path]:
     refine_model.to(DEVICE)
     ensemble_model.to(DEVICE).eval()
-    optimizer = torch.optim.Adam(refine_model.parameters(), lr=max(5e-4, cfg.lr * 0.5))
+    optimizer = torch.optim.AdamW(
+        refine_model.parameters(),
+        lr=max(5e-4, cfg.lr * 0.5),
+        weight_decay=1e-4 if HIGH_PERF else 0.0,
+    )
     scaler = GradScaler("cuda", enabled=USE_AMP)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, cfg.epochs * len(train_loader)), eta_min=max(cfg.lr * 0.1, 1e-6)
+    ) if HIGH_PERF else None
+    ema = ModelEMA(refine_model, decay=0.999) if HIGH_PERF else None
 
     best_dice = -1.0
+    best_ckpt: Optional[Path] = None
     for ep in range(1, cfg.epochs + 1):
         refine_model.train()
         run_loss = 0.0
@@ -858,6 +945,10 @@ def train_refinement_model(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(refine_model)
             run_loss += loss.item()
         print(f"Epoch {ep}/{cfg.epochs} | Refinement loss: {run_loss / len(train_loader):.4f}")
         if val_loader is not None:
@@ -870,11 +961,19 @@ def train_refinement_model(
                     p1 = normalize_segmentation_output(self.ens(x), ref_shape=x.shape[2:])
                     return normalize_segmentation_output(self.ref(torch.cat([x, p1], dim=1)), ref_shape=x.shape[2:])
             wrapped = _RefineWrap(ensemble_model, refine_model).to(DEVICE)
+            if ema is not None:
+                ema.apply_shadow(refine_model)
             metrics = evaluate_model(wrapped, val_loader, DEVICE, threshold=0.5)
+            if ema is not None:
+                ema.restore(refine_model)
             print(f"[Refine] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
             if metrics["Dice"] > best_dice:
                 best_dice = metrics["Dice"]
-                save_model_checkpoint(refine_model, "refinement_best", output_dir=output_dir)
+                best_ckpt = save_model_checkpoint(refine_model, "refinement_best", output_dir=output_dir)
+    if best_ckpt is not None:
+        refine_model.load_state_dict(torch.load(best_ckpt, map_location=DEVICE))
+        print(f"[Refine] Reloaded best checkpoint: {best_ckpt}")
+    return best_ckpt
 
 
 def train_single_model(
@@ -884,13 +983,18 @@ def train_single_model(
     model_name: str = "Model",
     val_loader: Optional[DataLoader] = None,
     output_dir: Path = OUTPUT_DIR,
-) -> None:
+) -> Optional[Path]:
     """Uniform base-model fine-tuning loop used for fair comparison."""
     model.to(DEVICE)
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4 if HIGH_PERF else 0.0)
     scaler = GradScaler("cuda", enabled=USE_AMP)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, cfg.epochs * len(train_loader)), eta_min=max(cfg.lr * 0.1, 1e-6)
+    ) if HIGH_PERF else None
+    ema = ModelEMA(model, decay=0.999) if HIGH_PERF else None
     best_dice = -1.0
+    best_ckpt: Optional[Path] = None
     for ep in range(1, cfg.epochs + 1):
         run_loss = 0.0
         model.train()
@@ -903,14 +1007,26 @@ def train_single_model(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if scheduler is not None:
+                scheduler.step()
+            if ema is not None:
+                ema.update(model)
             run_loss += loss.item()
         print(f"[{model_name}] Epoch {ep}/{cfg.epochs} | loss: {run_loss / len(train_loader):.4f}")
         if val_loader is not None:
+            if ema is not None:
+                ema.apply_shadow(model)
             metrics = evaluate_model(model, val_loader, DEVICE, threshold=0.5)
+            if ema is not None:
+                ema.restore(model)
             print(f"[{model_name}] val Dice: {metrics['Dice']:.4f} | IoU: {metrics['IoU']:.4f}")
             if metrics["Dice"] > best_dice:
                 best_dice = metrics["Dice"]
-                save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+                best_ckpt = save_model_checkpoint(model, f"{model_name}_best", output_dir=output_dir)
+    if best_ckpt is not None:
+        model.load_state_dict(torch.load(best_ckpt, map_location=DEVICE))
+        print(f"[{model_name}] Reloaded best checkpoint: {best_ckpt}")
+    return best_ckpt
 
 
 def save_model_checkpoint(model: nn.Module, name: str, output_dir: Path = OUTPUT_DIR) -> Path:
@@ -1355,12 +1471,13 @@ def run_full_pipeline() -> None:
             "num_workers": num_workers,
             "device": str(DEVICE),
             "amp": USE_AMP,
+            "high_perf": HIGH_PERF,
         },
         output_dir=output_dir,
     )
     print(
         f"[INFO] Uniform setup -> IMG_SIZE={img_size}, FINETUNE_SIZE={finetune_size}, "
-        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}"
+        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}, HIGH_PERF={int(HIGH_PERF)}"
     )
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
@@ -1417,7 +1534,7 @@ def run_full_pipeline() -> None:
     har = HAREnsemble(resunetpp, wdffnet, transfuse).to(DEVICE)
     # 2) Ensemble training.
     train_har_head(
-        har, train_loader, TrainConfig(epochs=epochs, lr=1e-3),
+        har, train_loader, TrainConfig(epochs=epochs, lr=3e-4),
         val_loader=val_loader, model_name="har_ensemble", output_dir=output_dir
     )
     if finetune_size > img_size:
@@ -1429,7 +1546,7 @@ def run_full_pipeline() -> None:
     # 3) Refinement training.
     refine_model = RefinementModel().to(DEVICE)
     train_refinement_model(
-        refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=8e-4),
+        refine_model, har, train_loader_ft, TrainConfig(epochs=max(3, epochs // 2), lr=4e-4),
         val_loader=val_loader_ft, output_dir=output_dir
     )
 
@@ -1466,7 +1583,7 @@ def run_full_pipeline() -> None:
             DEVICE,
             threshold=threshold,
             use_postprocess=(name == "HAR+Refine"),
-            use_tta=(name == "HAR+Refine"),
+            use_tta=(name == "HAR+Refine" or (HIGH_PERF and name == "HAR Ensemble")),
         )
         total_params = sum(p.numel() for p in mdl.parameters())
         trainable_params = sum(p.numel() for p in mdl.parameters() if p.requires_grad)
@@ -1564,5 +1681,7 @@ if __name__ == "__main__":
             "  %env FINETUNE_SIZE=512\n"
             "  %env BASE_EPOCHS=50\n"
             "  %env EPOCHS=50\n"
+            "  # optional high-performance profile:\n"
+            "  %env HIGH_PERF=1\n"
             "  %run colab_har_ensemble.py"
         )

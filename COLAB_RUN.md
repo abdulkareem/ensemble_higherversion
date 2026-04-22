@@ -65,6 +65,8 @@ from google.colab import files
 %env FINETUNE_SIZE=512
 %env BASE_EPOCHS=50
 %env EPOCHS=50
+# optional high-performance mode (scheduler + EMA + stronger augmentation + finer threshold calibration)
+%env HIGH_PERF=1
 %run colab_har_ensemble.py
 ```
 

@@ -165,13 +165,15 @@ class WeightedFusion(nn.Module):
 class WDFFNet(nn.Module):
     """Architecture kept aligned with training notebook implementation."""
 
-    def __init__(self, pretrained: bool = True, num_classes: int = 1):
+    def __init__(self, pretrained: bool = True, num_classes: int = 1, model_scale: str = "base"):
         super().__init__()
+        back_a_name = "efficientnet_b3" if model_scale == "strong" else "efficientnet_b0"
+        back_b_name = "resnet101" if model_scale == "strong" else "resnet50"
         self.back_a = timm.create_model(
-            "efficientnet_b0", pretrained=pretrained, features_only=True, out_indices=(1, 2, 3, 4)
+            back_a_name, pretrained=pretrained, features_only=True, out_indices=(1, 2, 3, 4)
         )
         self.back_b = timm.create_model(
-            "resnet50", pretrained=pretrained, features_only=True, out_indices=(1, 2, 3, 4)
+            back_b_name, pretrained=pretrained, features_only=True, out_indices=(1, 2, 3, 4)
         )
 
         ch_a = self.back_a.feature_info.channels()
@@ -245,11 +247,13 @@ class BiFusionBlock(nn.Module):
 class TransFuseSimple(nn.Module):
     """Architecture kept aligned with training notebook implementation."""
 
-    def __init__(self, num_classes: int = 1, pretrained: bool = True, transfuse_input_size: int = 224):
+    def __init__(self, num_classes: int = 1, pretrained: bool = True, transfuse_input_size: int = 224, model_scale: str = "base"):
         super().__init__()
         self.transfuse_input_size = transfuse_input_size
-        self.cnn = timm.create_model("efficientnet_b0", pretrained=pretrained, features_only=True)
-        self.trans = timm.create_model("mobilenetv3_large_100", pretrained=pretrained, features_only=True)
+        cnn_name = "efficientnet_b2" if model_scale == "strong" else "efficientnet_b0"
+        trans_name = "resnet34" if model_scale == "strong" else "mobilenetv3_large_100"
+        self.cnn = timm.create_model(cnn_name, pretrained=pretrained, features_only=True)
+        self.trans = timm.create_model(trans_name, pretrained=pretrained, features_only=True)
 
         cnn_ch = self.cnn.feature_info.channels()
         trans_ch = self.trans.feature_info.channels()
@@ -380,18 +384,18 @@ class KvasirDataset(Dataset):
                 self.tf = A.Compose([
                     A.Resize(size, size),
                     A.HorizontalFlip(p=0.5),
-                    A.VerticalFlip(p=0.3),
-                    A.RandomRotate90(p=0.4),
-                    A.ShiftScaleRotate(
-                        shift_limit=0.05,
-                        scale_limit=0.15,
-                        rotate_limit=20,
-                        p=0.6,
+                    A.VerticalFlip(p=0.2),
+                    A.RandomRotate90(p=0.25),
+                    A.Affine(
+                        scale=(0.95, 1.08),
+                        translate_percent=(-0.03, 0.03),
+                        rotate=(-12, 12),
+                        p=0.35,
                         border_mode=cv2.BORDER_REFLECT,
                     ),
-                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-                    A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12, val_shift_limit=8, p=0.3),
-                    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+                    A.RandomBrightnessContrast(brightness_limit=0.12, contrast_limit=0.12, p=0.35),
+                    A.HueSaturationValue(hue_shift_limit=5, sat_shift_limit=8, val_shift_limit=5, p=0.2),
+                    A.GaussianBlur(blur_limit=(3, 3), p=0.1),
                     A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
                 ])
             else:
@@ -421,7 +425,14 @@ class KvasirDataset(Dataset):
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
-def make_loaders(data_dir: str, size: int = 352, batch_size: int = 8, num_workers: int = 2):
+def make_loaders(
+    data_dir: str,
+    size: int = 352,
+    batch_size: int = 8,
+    num_workers: int = 2,
+    val_frac: float = 0.1,
+    test_frac: float = 0.1,
+):
     images = sorted(glob(os.path.join(data_dir, "images", "*.jpg")))
     masks = sorted(glob(os.path.join(data_dir, "masks", "*.jpg")))
     if len(masks) == 0:
@@ -429,12 +440,21 @@ def make_loaders(data_dir: str, size: int = 352, batch_size: int = 8, num_worker
     assert len(images) == len(masks), "Image/mask count mismatch"
 
     df = pd.DataFrame({"image": images, "mask": masks}).sample(frac=1, random_state=42).reset_index(drop=True)
-    val_df = df.sample(frac=0.1, random_state=42)
-    train_df = df.drop(val_df.index).reset_index(drop=True)
+    val_df = df.sample(frac=val_frac, random_state=42)
+    rem_df = df.drop(val_df.index).reset_index(drop=True)
+    if test_frac > 0:
+        adjusted_test_frac = min(0.5, test_frac / max(1e-6, (1.0 - val_frac)))
+        test_df = rem_df.sample(frac=adjusted_test_frac, random_state=42)
+        train_df = rem_df.drop(test_df.index).reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+    else:
+        train_df = rem_df.reset_index(drop=True)
+        test_df = rem_df.iloc[:0].copy()
     val_df = val_df.reset_index(drop=True)
 
     train_ds = KvasirDataset(train_df, size=size, augment=True)
     val_ds = KvasirDataset(val_df, size=size, augment=False)
+    test_ds = KvasirDataset(test_df, size=size, augment=False)
 
     train_loader = DataLoader(
         train_ds,
@@ -452,7 +472,15 @@ def make_loaders(data_dir: str, size: int = 352, batch_size: int = 8, num_worker
         pin_memory=(DEVICE.type == "cuda"),
         persistent_workers=(num_workers > 0),
     )
-    return train_loader, val_loader
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=(DEVICE.type == "cuda"),
+        persistent_workers=(num_workers > 0),
+    )
+    return train_loader, val_loader, test_loader
 
 
 # =========================
@@ -727,6 +755,16 @@ def find_best_threshold(preds: torch.Tensor, masks: torch.Tensor) -> float:
     return best_t
 
 
+def find_best_threshold_for_model(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_tta: bool = False,
+) -> float:
+    preds, masks = collect_preds_and_masks(model, loader, device, use_tta=use_tta)
+    return find_best_threshold(preds, masks)
+
+
 def multi_scale_predict(model: nn.Module, img: torch.Tensor, scales: Iterable[float] = (0.75, 1.0, 1.25)) -> torch.Tensor:
     """Run model at multiple scales and return averaged sigmoid output."""
     model.eval()
@@ -772,6 +810,16 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
     return 1 - dice.mean()
 
 
+def tversky_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.3, beta: float = 0.7, eps: float = 1e-6) -> torch.Tensor:
+    pred_f = pred.reshape(pred.shape[0], -1)
+    target_f = target.reshape(target.shape[0], -1)
+    tp = (pred_f * target_f).sum(dim=1)
+    fp = (pred_f * (1 - target_f)).sum(dim=1)
+    fn = ((1 - pred_f) * target_f).sum(dim=1)
+    tversky = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
+    return 1 - tversky.mean()
+
+
 def bce_from_probs(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
     BCE computed from probabilities without calling F.binary_cross_entropy.
@@ -799,13 +847,15 @@ def boundary_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(pred_b, tar_b)
 
 
-def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor, use_deep_supervision: bool = False) -> torch.Tensor:
     loss_bce = bce_from_probs(pred, target)
     loss_dice = dice_loss(pred, target)
     loss_focal = focal_loss(pred, target)
     loss_boundary = boundary_loss(pred, target)
     base = 0.3 * loss_bce + 0.3 * loss_dice + 0.3 * loss_focal + 0.1 * loss_boundary
-    if not HIGH_PERF:
+    if HIGH_PERF:
+        base = 0.25 * loss_bce + 0.25 * loss_dice + 0.25 * loss_focal + 0.1 * loss_boundary + 0.15 * tversky_loss(pred, target)
+    if not use_deep_supervision:
         return base
     # Deep-supervision-style multi-scale regularization.
     p2 = F.interpolate(pred, scale_factor=0.5, mode="bilinear", align_corners=False)
@@ -813,7 +863,7 @@ def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     p4 = F.interpolate(pred, scale_factor=0.25, mode="bilinear", align_corners=False)
     t4 = F.interpolate(target, scale_factor=0.25, mode="nearest")
     ds = 0.5 * (dice_loss(p2, t2) + bce_from_probs(p2, t2)) + 0.5 * (dice_loss(p4, t4) + bce_from_probs(p4, t4))
-    return base + 0.2 * ds
+    return base + 0.05 * ds
 
 
 class ModelEMA:
@@ -876,7 +926,7 @@ def train_har_head(
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss = combined_seg_loss(p, y)
+                loss = combined_seg_loss(p, y, use_deep_supervision=HIGH_PERF)
 
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(
@@ -941,7 +991,7 @@ def train_refinement_model(
             with autocast(device_type="cuda", enabled=USE_AMP):
                 ref_input = torch.cat([x, p1], dim=1)
                 p2 = normalize_segmentation_output(refine_model(ref_input), ref_shape=y.shape[2:])
-                loss = combined_seg_loss(p2, y)
+                loss = combined_seg_loss(p2, y, use_deep_supervision=HIGH_PERF)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -1003,7 +1053,7 @@ def train_single_model(
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type="cuda", enabled=USE_AMP):
                 p = normalize_segmentation_output(model(x), ref_shape=y.shape[2:])
-                loss = combined_seg_loss(p, y)
+                loss = combined_seg_loss(p, y, use_deep_supervision=False)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -1459,6 +1509,9 @@ def run_full_pipeline() -> None:
     img_size = int(os.environ.get("IMG_SIZE", "512"))
     finetune_size = int(os.environ.get("FINETUNE_SIZE", str(img_size)))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
+    val_frac = float(os.environ.get("VAL_FRAC", "0.1"))
+    test_frac = float(os.environ.get("TEST_FRAC", "0.1"))
+    model_scale = os.environ.get("MODEL_SCALE", "base").strip().lower()
     output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     save_run_hyperparams(
@@ -1469,6 +1522,9 @@ def run_full_pipeline() -> None:
             "img_size": img_size,
             "finetune_size": finetune_size,
             "num_workers": num_workers,
+            "val_frac": val_frac,
+            "test_frac": test_frac,
+            "model_scale": model_scale,
             "device": str(DEVICE),
             "amp": USE_AMP,
             "high_perf": HIGH_PERF,
@@ -1477,16 +1533,18 @@ def run_full_pipeline() -> None:
     )
     print(
         f"[INFO] Uniform setup -> IMG_SIZE={img_size}, FINETUNE_SIZE={finetune_size}, "
-        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}, HIGH_PERF={int(HIGH_PERF)}"
+        f"BASE_EPOCHS={base_epochs}, EPOCHS={epochs}, USE_CKPT={int(use_ckpt)}, "
+        f"HIGH_PERF={int(HIGH_PERF)}, MODEL_SCALE={model_scale}, VAL_FRAC={val_frac}, TEST_FRAC={test_frac}"
     )
 
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
     resunetpp = ResUnetPPBuilder().to(DEVICE)
-    wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
+    wdffnet = WDFFNet(pretrained=False, num_classes=1, model_scale=model_scale).to(DEVICE)
     transfuse = TransFuseSimple(
         num_classes=1,
         pretrained=False,
         transfuse_input_size=finetune_size,
+        model_scale=model_scale,
     ).to(DEVICE)
 
     if use_ckpt:
@@ -1500,21 +1558,25 @@ def run_full_pipeline() -> None:
     else:
         print("[INFO] Training from scratch (USE_CKPT=0).")
 
-    train_loader, val_loader = make_loaders(
+    train_loader, val_loader, test_loader = make_loaders(
         data_dir,
         size=img_size,
         batch_size=batch_size,
         num_workers=num_workers,
+        val_frac=val_frac,
+        test_frac=test_frac,
     )
     # Uniform loader setup by default (same resolution for base/ensemble/refinement).
     if finetune_size == img_size:
-        train_loader_ft, val_loader_ft = train_loader, val_loader
+        train_loader_ft, val_loader_ft, test_loader_ft = train_loader, val_loader, test_loader
     else:
-        train_loader_ft, val_loader_ft = make_loaders(
+        train_loader_ft, val_loader_ft, test_loader_ft = make_loaders(
             data_dir,
             size=finetune_size,
             batch_size=max(1, batch_size // 2),
             num_workers=num_workers,
+            val_frac=val_frac,
+            test_frac=test_frac,
         )
     # 1) Uniform base-model training before ensemble training.
     if base_epochs > 0:
@@ -1573,17 +1635,25 @@ def run_full_pipeline() -> None:
         "HAR+Refine": cascade_model,
     }
 
+    threshold_map = {
+        "ResUNet++": find_best_threshold_for_model(resunetpp, val_loader_ft, DEVICE, use_tta=HIGH_PERF),
+        "WDFFNet": find_best_threshold_for_model(wdffnet, val_loader_ft, DEVICE, use_tta=HIGH_PERF),
+        "TransFuse": find_best_threshold_for_model(transfuse, val_loader_ft, DEVICE, use_tta=HIGH_PERF),
+        "HAR Ensemble": best_thr,
+        "HAR+Refine": best_thr,
+    }
+
     rows, csv_rows = [], []
     model_details_rows = []
     for name, mdl in base_wrappers.items():
-        threshold = best_thr if name in ("HAR Ensemble", "HAR+Refine") else 0.5
+        threshold = threshold_map.get(name, 0.5)
         m = evaluate_model(
             mdl,
-            val_loader_ft,
+            test_loader_ft if len(test_loader_ft.dataset) > 0 else val_loader_ft,
             DEVICE,
             threshold=threshold,
             use_postprocess=(name == "HAR+Refine"),
-            use_tta=(name == "HAR+Refine" or (HIGH_PERF and name == "HAR Ensemble")),
+            use_tta=(HIGH_PERF or name == "HAR+Refine"),
         )
         total_params = sum(p.numel() for p in mdl.parameters())
         trainable_params = sum(p.numel() for p in mdl.parameters() if p.requires_grad)
@@ -1683,5 +1753,10 @@ if __name__ == "__main__":
             "  %env EPOCHS=50\n"
             "  # optional high-performance profile:\n"
             "  %env HIGH_PERF=1\n"
+            "  # optional stronger backbones:\n"
+            "  %env MODEL_SCALE=strong\n"
+            "  # optional explicit validation/test fractions:\n"
+            "  %env VAL_FRAC=0.1\n"
+            "  %env TEST_FRAC=0.1\n"
             "  %run colab_har_ensemble.py"
         )

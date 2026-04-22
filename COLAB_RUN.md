@@ -65,8 +65,13 @@ from google.colab import files
 %env FINETUNE_SIZE=512
 %env BASE_EPOCHS=50
 %env EPOCHS=50
-# optional high-performance mode (scheduler + EMA + stronger augmentation + finer threshold calibration)
+# optional high-performance mode (scheduler + EMA + calibration; if early Dice collapses, set HIGH_PERF=0)
 %env HIGH_PERF=1
+# optional stronger backbones for better Dice
+%env MODEL_SCALE=strong
+# optional held-out test split settings
+%env VAL_FRAC=0.1
+%env TEST_FRAC=0.1
 %run colab_har_ensemble.py
 ```
 

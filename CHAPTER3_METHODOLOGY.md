@@ -20,7 +20,7 @@ To avoid information leakage and to maintain experimental reproducibility, the d
 
 All models receive identical input statistics to ensure fairness:
 
-1. Spatial resizing to 256×256.
+1. Spatial resizing to 512×512.
 2. Intensity normalization using ImageNet mean and standard deviation.
 3. Mask conversion to floating-point [0, 1], followed by binary thresholding.
 
@@ -30,15 +30,15 @@ A single preprocessing policy is applied to all architectures so observed differ
 
 ## 3.3.1 ResUNet++
 
-ResUNet++ is integrated through a wrapper that preserves the original network implementation while enforcing interface compatibility with the shared training framework. Inputs are three-channel images of size 256×256, and outputs are constrained to one-channel 256×256 logits via interpolation when required. This wrapper-based strategy preserves architectural fidelity and resolves checkpoint-interface inconsistencies.
+ResUNet++ is integrated through a wrapper that preserves the original network implementation while enforcing interface compatibility with the shared training framework. Inputs are three-channel images of size 512×512, and outputs are constrained to one-channel 512×512 logits via interpolation when required. This wrapper-based strategy preserves architectural fidelity and resolves checkpoint-interface inconsistencies.
 
 ## 3.3.2 TransFuse
 
-The TransFuse implementation employs a dual-stream feature extraction strategy, where two feature backbones are fused at multiple semantic levels via BiFusion blocks. Deep and intermediate fused representations are upsampled and concatenated with shallow features before a final projection layer generates segmentation logits. To guarantee compatibility with supervision masks, predictions are explicitly resized to 256×256.
+The TransFuse implementation employs a dual-stream feature extraction strategy, where two feature backbones are fused at multiple semantic levels via BiFusion blocks. Deep and intermediate fused representations are upsampled and concatenated with shallow features before a final projection layer generates segmentation logits. To guarantee compatibility with supervision masks, predictions are explicitly resized to 512×512.
 
 ## 3.3.3 WDFFNet
 
-WDFFNet adopts a dual-backbone design and performs stage-wise cross-branch fusion using learnable weighted fusion modules. Fused features are further refined with object-aware attention (channel and spatial mechanisms) and decoded progressively using upsampling and skip concatenation. Final logits are projected to a one-channel segmentation map and normalized to 256×256 spatial resolution.
+WDFFNet adopts a dual-backbone design and performs stage-wise cross-branch fusion using learnable weighted fusion modules. Fused features are further refined with object-aware attention (channel and spatial mechanisms) and decoded progressively using upsampling and skip concatenation. Final logits are projected to a one-channel segmentation map and normalized to 512×512 spatial resolution.
 
 ## 3.4 Shape and Checkpoint Consistency Controls
 

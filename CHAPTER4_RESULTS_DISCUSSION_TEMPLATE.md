@@ -8,7 +8,7 @@ This chapter presents the quantitative and qualitative evaluation of ResUNet++, 
 
 ## 4.2 Experimental Configuration for Final Reporting
 
-- Input resolution: **256×256**
+- Input resolution: **512×512**
 - Preprocessing: ImageNet normalization (mean=(0.485,0.456,0.406), std=(0.229,0.224,0.225))
 - Loss: \(0.5\,\text{BCE} + 0.5\,\text{Dice}\)
 - Optimizer: Adam, learning rate \(1\times10^{-4}\)

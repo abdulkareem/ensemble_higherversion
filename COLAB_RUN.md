@@ -50,7 +50,25 @@ from google.colab import files
 # files.upload()  # optional
 ```
 
-## 6) Run end-to-end pipeline
+## 6) Run end-to-end pipeline (recommended: `colab_har_ensemble.py`, uniform 512×512)
+
+> Important: set each `%env` on a separate line in Colab.
+
+```python
+%env DATA_DIR=/content/data/Kvasir-SEG
+# optional if dataset is zipped on Drive
+%env DATA_ZIP=/content/drive/MyDrive/datasets/Kvasir-SEG.zip
+%env RESUNET_REPO=/content/ResUNetPlusPlus
+%env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git
+%env USE_CKPT=0
+%env IMG_SIZE=512
+%env FINETUNE_SIZE=512
+%env BASE_EPOCHS=50
+%env EPOCHS=50
+%run colab_har_ensemble.py
+```
+
+Alternative CLI workflow:
 
 ```python
 !python colab_pipeline.py \
@@ -83,9 +101,13 @@ With checkpoints:
   - `best_wdffnet.pth`
   - `best_ensemble.pth`
 - CSV table: `comparison_table.csv`
+- Model detail files:
+  - `model_details.csv`
+  - `model_details.json`
 - Plots:
   - training curves
   - prediction panels (input, GT, each model, ensemble)
+  - one-sheet comparison across all models (`all_models_visual_comparison.png`)
   - Dice bar chart
 
 ## 8) Common troubleshooting

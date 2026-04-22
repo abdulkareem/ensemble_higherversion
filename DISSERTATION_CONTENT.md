@@ -19,7 +19,7 @@ Kvasir-SEG contains RGB endoscopic images and corresponding binary masks. Images
 ### 2.2 Unified Preprocessing
 To ensure fair comparison across architectures, all models use an identical data pipeline:
 
-1. Resize image and mask to **256 × 256**.
+1. Resize image and mask to **512 × 512**.
 2. Normalize RGB images with ImageNet statistics:
    - mean = (0.485, 0.456, 0.406)
    - std = (0.229, 0.224, 0.225)
@@ -38,8 +38,8 @@ Data is shuffled with fixed seed and split into train/validation/test subsets us
 ResUNet++ is imported from the original source implementation via dynamic module loading to preserve architectural fidelity. The wrapper:
 
 - instantiates `build_resunetplusplus()` from the external file,
-- accepts 3-channel 256×256 input,
-- forces output to 1-channel 256×256 using bilinear interpolation when needed.
+- accepts 3-channel 512×512 input,
+- forces output to 1-channel 512×512 using bilinear interpolation when needed.
 
 This solves practical output-size mismatch without modifying the original core architecture.
 
@@ -63,7 +63,7 @@ with BiFusion blocks at multiple semantic scales:
 
 Fused deep/mid features are upsampled to shallow spatial resolution, concatenated, and projected to one-channel logits with a 1×1 convolution.
 
-Finally, prediction is upsampled/interpolated to fixed 256×256 output.
+Finally, prediction is upsampled/interpolated to fixed 512×512 output.
 
 ### Why TransFuse helps
 The dual-path design mixes local texture cues from convolutional features with broader semantic representations, reducing missed polyps and improving context robustness.
@@ -89,7 +89,7 @@ Decoder design:
 - staged 3×3 refinement,
 - final 1×1 projection to binary logits.
 
-Output is interpolated to 256×256.
+Output is interpolated to 512×512.
 
 ### Why WDFFNet helps
 Combining two heterogeneous encoders improves feature diversity. Weighted fusion and attention increase saliency for small or ambiguous lesions.
@@ -227,7 +227,7 @@ These controls reduce experimental variance and prevent silent shape/configurati
 
 ## 11. Example Methodology Paragraph (Ready to paste)
 
-> We implemented a unified segmentation framework in PyTorch for Kvasir-SEG using ResUNet++, TransFuse, and WDFFNet under identical preprocessing conditions (256×256 resize and ImageNet normalization). Each model was trained independently with a balanced Dice-BCE objective and Adam optimization (1e-4), selecting checkpoints by best validation Dice. To leverage model complementarity, we introduced a learnable weighted ensemble that freezes base networks and estimates adaptive per-pixel fusion weights via a lightweight softmax head. Evaluation was performed on a held-out test split using Dice, IoU, Precision, Recall, and Accuracy, supplemented with computational profiling (parameter counts and FPS). This design ensures architectural fairness, reproducibility, and robust comparative analysis for medical image segmentation.
+> We implemented a unified segmentation framework in PyTorch for Kvasir-SEG using ResUNet++, TransFuse, and WDFFNet under identical preprocessing conditions (512×512 resize and ImageNet normalization). Each model was trained independently with a balanced Dice-BCE objective and Adam optimization (1e-4), selecting checkpoints by best validation Dice. To leverage model complementarity, we introduced a learnable weighted ensemble that freezes base networks and estimates adaptive per-pixel fusion weights via a lightweight softmax head. Evaluation was performed on a held-out test split using Dice, IoU, Precision, Recall, and Accuracy, supplemented with computational profiling (parameter counts and FPS). This design ensures architectural fairness, reproducibility, and robust comparative analysis for medical image segmentation.
 
 ---
 

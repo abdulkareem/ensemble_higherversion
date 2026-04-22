@@ -15,6 +15,7 @@ import random
 import subprocess
 import importlib.util
 import time
+import json
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -958,6 +959,31 @@ def _env_path(name: str) -> Optional[str]:
     return raw if raw else None
 
 
+def _repair_malformed_colab_env() -> None:
+    """
+    Recover from a common Colab mistake where multiple %env assignments are pasted
+    into one line/string (e.g., BASE_EPOCHS contains '\\nenv: EPOCHS=50 ...').
+    """
+    parsed_updates: Dict[str, str] = {}
+    for key, value in list(os.environ.items()):
+        if "\\n" not in value and "\nenv:" not in value and "env:" not in value:
+            continue
+        normalized = value.replace("\\n", "\n")
+        candidate_lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+        for ln in candidate_lines:
+            if ln.lower().startswith("env:"):
+                ln = ln.split(":", 1)[1].strip()
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k and v and k.isupper():
+                    parsed_updates[k] = v
+    if parsed_updates:
+        os.environ.update(parsed_updates)
+        fixed_keys = ", ".join(sorted(parsed_updates.keys()))
+        print(f"[INFO] Recovered malformed env assignments for: {fixed_keys}")
+
+
 def _must_exist(path: Optional[str], label: str) -> Optional[str]:
     if not path:
         return None
@@ -1270,6 +1296,7 @@ def run_full_pipeline() -> None:
       RESUNET_CKPT, WDFF_CKPT, TRANSFUSE_CKPT, USE_CKPT, EPOCHS, BATCH_SIZE, IMG_SIZE, FINETUNE_SIZE, NUM_WORKERS
     """
     mount_drive_if_needed()
+    _repair_malformed_colab_env()
 
     data_dir = _must_exist(_auto_prepare_data_dir(), "DATA_DIR")
     resunet_repo = _must_exist(_auto_prepare_resunet_repo(), "RESUNET_REPO")
@@ -1299,7 +1326,7 @@ def run_full_pipeline() -> None:
     epochs = int(os.environ.get("EPOCHS", "12"))
     base_epochs = int(os.environ.get("BASE_EPOCHS", "2"))
     batch_size = int(os.environ.get("BATCH_SIZE", "8"))
-    img_size = int(os.environ.get("IMG_SIZE", "320"))
+    img_size = int(os.environ.get("IMG_SIZE", "512"))
     finetune_size = int(os.environ.get("FINETUNE_SIZE", str(img_size)))
     num_workers = int(os.environ.get("NUM_WORKERS", "2"))
     output_dir = OUTPUT_DIR
@@ -1325,7 +1352,11 @@ def run_full_pipeline() -> None:
     ResUnetPPBuilder = import_resunetplusplus_builder(resunet_repo)
     resunetpp = ResUnetPPBuilder().to(DEVICE)
     wdffnet = WDFFNet(pretrained=False, num_classes=1).to(DEVICE)
-    transfuse = TransFuseSimple(num_classes=1, pretrained=False, transfuse_input_size=224).to(DEVICE)
+    transfuse = TransFuseSimple(
+        num_classes=1,
+        pretrained=False,
+        transfuse_input_size=finetune_size,
+    ).to(DEVICE)
 
     if use_ckpt:
         if resunet_ckpt and os.path.exists(resunet_ckpt):
@@ -1412,6 +1443,7 @@ def run_full_pipeline() -> None:
     }
 
     rows, csv_rows = [], []
+    model_details_rows = []
     for name, mdl in base_wrappers.items():
         threshold = best_thr if name in ("HAR Ensemble", "HAR+Refine") else 0.5
         m = evaluate_model(
@@ -1422,11 +1454,26 @@ def run_full_pipeline() -> None:
             use_postprocess=(name == "HAR+Refine"),
             use_tta=(name == "HAR+Refine"),
         )
-        params = sum(p.numel() for p in mdl.parameters()) / 1e6
+        total_params = sum(p.numel() for p in mdl.parameters())
+        trainable_params = sum(p.numel() for p in mdl.parameters() if p.requires_grad)
+        params = total_params / 1e6
         fps = estimate_fps(mdl, val_loader_ft)
         rows.append([name, m["Dice"], m["IoU"], params, fps])
         csv_rows.append({"Model": name, "Dice": m["Dice"], "IoU": m["IoU"], "Params(M)": params, "FPS": fps})
         ckpt = save_model_checkpoint(mdl, name, output_dir=output_dir)
+        model_details_rows.append(
+            {
+                "Model": name,
+                "TotalParams": int(total_params),
+                "TrainableParams": int(trainable_params),
+                "FrozenParams": int(total_params - trainable_params),
+                "Checkpoint": str(ckpt),
+                "Dice": float(m["Dice"]),
+                "IoU": float(m["IoU"]),
+                "Threshold": float(threshold),
+                "InputSize": int(finetune_size),
+            }
+        )
         print(f"[Saved] {name} checkpoint -> {ckpt}")
 
     print(
@@ -1439,6 +1486,10 @@ def run_full_pipeline() -> None:
     )
     comp_df = pd.DataFrame(csv_rows)
     comp_df.to_csv(output_dir / "comparison_table.csv", index=False)
+    details_df = pd.DataFrame(model_details_rows)
+    details_df.to_csv(output_dir / "model_details.csv", index=False)
+    with open(output_dir / "model_details.json", "w", encoding="utf-8") as f:
+        json.dump(model_details_rows, f, indent=2)
     plot_metrics(comp_df, output_dir=output_dir)
     visualize_predictions(cascade_model, val_loader_ft, output_dir=output_dir, num_samples=6)
     save_loader_comparison_sheet(
@@ -1486,6 +1537,7 @@ if __name__ == "__main__":
             )
         print(
             "[INFO] To run in Colab, set env vars first:\n"
+            "  # IMPORTANT: set each variable on a separate line.\n"
             "  %env DATA_DIR=/content/data/Kvasir-SEG\n"
             "  # or provide zipped dataset:\n"
             "  %env DATA_ZIP=/content/drive/MyDrive/datasets/Kvasir-SEG.zip\n"
@@ -1494,7 +1546,9 @@ if __name__ == "__main__":
             "  %env RESUNET_REPO_URL=https://github.com/DebeshJha/ResUNetPlusPlus.git\n"
             "  # train from scratch (recommended):\n"
             "  %env USE_CKPT=0\n"
-            "  %env IMG_SIZE=320\n"
-            "  %env FINETUNE_SIZE=320\n"
+            "  %env IMG_SIZE=512\n"
+            "  %env FINETUNE_SIZE=512\n"
+            "  %env BASE_EPOCHS=50\n"
+            "  %env EPOCHS=50\n"
             "  %run colab_har_ensemble.py"
         )

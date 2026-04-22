@@ -750,9 +750,21 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
     return 1 - dice.mean()
 
 
+def bce_from_probs(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    BCE computed from probabilities without calling F.binary_cross_entropy.
+    This avoids CUDA autocast safety errors for BCE-on-probabilities paths.
+    """
+    pred = pred.float().clamp(eps, 1.0 - eps)
+    target = target.float()
+    loss = -(target * torch.log(pred) + (1.0 - target) * torch.log(1.0 - pred))
+    return loss.mean()
+
+
 def focal_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.8, gamma: float = 2.0) -> torch.Tensor:
-    pred = pred.clamp(1e-6, 1 - 1e-6)
-    bce = F.binary_cross_entropy(pred, target, reduction="none")
+    pred = pred.float().clamp(1e-6, 1 - 1e-6)
+    target = target.float()
+    bce = -(target * torch.log(pred) + (1.0 - target) * torch.log(1.0 - pred))
     pt = torch.where(target == 1, pred, 1 - pred)
     return (alpha * (1 - pt) ** gamma * bce).mean()
 
@@ -766,7 +778,7 @@ def boundary_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def combined_seg_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    loss_bce = F.binary_cross_entropy(pred.float(), target.float())
+    loss_bce = bce_from_probs(pred, target)
     loss_dice = dice_loss(pred, target)
     loss_focal = focal_loss(pred, target)
     loss_boundary = boundary_loss(pred, target)

@@ -229,8 +229,14 @@ class BiFusionBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, cnn_feat: torch.Tensor, trans_feat: torch.Tensor) -> torch.Tensor:
-        if trans_feat.ndim == 4 and trans_feat.shape[1] < 10:
-            trans_feat = trans_feat.permute(0, 3, 1, 2)
+        # Robust NHWC->NCHW fix only when needed.
+        # We infer layout from the expected input channels of conv_trans.
+        if (
+            trans_feat.ndim == 4
+            and trans_feat.shape[1] != self.conv_trans.in_channels
+            and trans_feat.shape[-1] == self.conv_trans.in_channels
+        ):
+            trans_feat = trans_feat.permute(0, 3, 1, 2).contiguous()
         x = self.conv_cnn(cnn_feat) + self.conv_trans(trans_feat)
         return self.act(self.conv_out(x))
 
@@ -258,11 +264,7 @@ class TransFuseSimple(nn.Module):
             x, size=(self.transfuse_input_size, self.transfuse_input_size), mode="bilinear", align_corners=False
         )
         cnn_feats = self.cnn(x_224)
-        trans_feats = []
-        for t in self.trans(x_224):
-            if t.ndim == 4 and t.shape[-1] > t.shape[1]:
-                t = t.permute(0, 3, 1, 2)
-            trans_feats.append(t)
+        trans_feats = self.trans(x_224)
 
         f3 = self.fuse3(cnn_feats[-1], trans_feats[-1])
         f2 = self.fuse2(cnn_feats[-2], trans_feats[-2])

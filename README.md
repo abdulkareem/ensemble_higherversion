@@ -75,4 +75,4 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if your chosen branch is missing, runs readiness checks, and optionally builds the publication result bundle.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with metric auto-discovery + fail-loud behavior when metrics are missing.

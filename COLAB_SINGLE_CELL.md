@@ -2,10 +2,10 @@
 
 Copy-paste this **single Colab cell** to install dependencies, clone the repo, run sanity checks, and build publication tables.
 
-> Why the previous run failed: `--require-metrics` was enabled, but no `metrics*.json/results*.json` files were found under your `METRICS_DIR`.
+> If it used to finish in seconds, it was because no metrics files were found. This version defaults to **failing** when metrics are absent (so you don't get a false "Completed").
 
 ```python
-# ======= Mamba-Fusion: Single Colab Cell (robust branch + metrics checks) =======
+# ======= Mamba-Fusion: Single Colab Cell (robust branch + strict metrics checks) =======
 import os, subprocess, sys, glob
 
 REPO_URL = "https://github.com/abdulkareem/ensemble_higherversion.git"
@@ -19,7 +19,7 @@ METRICS_JSONS = []
 # Auto-discover metrics if METRICS_JSONS is empty
 AUTO_DISCOVER_METRICS = True
 METRICS_DIR = "/content/drive/MyDrive"   # where your metrics*.json/results*.json exist
-REQUIRE_METRICS = False  # set True only after your metrics files are actually created
+ALLOW_EMPTY_METRICS = False  # False => fail if no metrics found (recommended)
 
 OUTPUT_DIR = "/content/drive/MyDrive/mamba_fusion_publication_bundle"
 
@@ -58,8 +58,8 @@ if METRICS_JSONS:
     cmd += ["--metrics-json", *METRICS_JSONS]
 if AUTO_DISCOVER_METRICS:
     cmd += ["--auto-discover-metrics", "--metrics-dir", METRICS_DIR]
-if REQUIRE_METRICS:
-    cmd += ["--require-metrics"]
+if ALLOW_EMPTY_METRICS:
+    cmd += ["--allow-empty-metrics"]
 
 try:
     subprocess.check_call(cmd)
@@ -76,11 +76,11 @@ except subprocess.CalledProcessError as e:
         print("[HINT] No metrics files found yet. Run training/evaluation first, then re-run this cell.")
     raise
 
-print("\n✅ Completed.")
+print("\n✅ Completed with publication bundle generated.")
 # ==============================================================================
 ```
 
 ### Notes
 - If you use private repos, authenticate Git in Colab first.
 - Use `publication_results.py` only with **real experimental metrics** (no fabricated values).
-- Once metrics files exist, you can set `REQUIRE_METRICS = True` for strict pipeline enforcement.
+- Set `ALLOW_EMPTY_METRICS = True` only if you intentionally want a quick non-failing smoke run.

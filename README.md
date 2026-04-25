@@ -75,4 +75,4 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with metric auto-discovery plus actionable diagnostics when metrics files are missing.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` in strict mode so missing metrics do not silently pass.

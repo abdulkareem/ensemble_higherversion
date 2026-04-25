@@ -23,7 +23,6 @@ def discover_metrics(metrics_dir: str):
     found = []
     for pattern in DISCOVERY_GLOBS:
         found.extend(base.glob(pattern))
-    # unique + deterministic order
     unique = sorted({str(p) for p in found if p.is_file()})
     return unique
 
@@ -34,7 +33,7 @@ def parse_args():
     p.add_argument("--metrics-json", nargs="*", default=[], help="Metric JSON files for publication bundle.")
     p.add_argument("--auto-discover-metrics", action="store_true", help="Auto-discover metrics JSON files under --metrics-dir.")
     p.add_argument("--metrics-dir", default="outputs", help="Directory used for auto metric discovery.")
-    p.add_argument("--require-metrics", action="store_true", help="Fail if no metric files are provided/discovered.")
+    p.add_argument("--allow-empty-metrics", action="store_true", help="Allow successful exit even when no metrics were found.")
     p.add_argument("--output-dir", default="outputs/publication_bundle", help="Output dir for bundled tables.")
     return p.parse_args()
 
@@ -70,14 +69,16 @@ def main():
         ])
     else:
         msg = (
-            "No metrics JSON files found. Provide --metrics-json <files> "
+            "No metrics JSON files found. Provide --metrics-json <files>, "
             "or use --auto-discover-metrics --metrics-dir <dir>."
         )
-        if args.require_metrics:
+        if args.allow_empty_metrics:
+            print(f"[WARN] {msg}")
+            print("[WARN] Exiting without publication bundle because --allow-empty-metrics was set.")
+        else:
             print(f"[ERROR] {msg}")
-            print("[HINT] Set --metrics-json explicitly or disable strict mode by removing --require-metrics.")
+            print("[HINT] Generate evaluation metrics first, then rerun this command.")
             sys.exit(2)
-        print(f"[INFO] {msg}")
 
     print("\n[DONE] run_all.py completed.")
 

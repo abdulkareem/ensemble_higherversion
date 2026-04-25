@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -8,29 +8,64 @@ import torch.nn.functional as F
 from utils import compute_metrics_from_logits, dice_bce_loss, ensure_binary_output
 
 
-class CrossScaleFusionModule(nn.Module):
-    """Adaptive multi-scale fusion to address polyp size variation."""
+class CrossScaleGatedFusionModule(nn.Module):
+    """Cross-Scale Gated Fusion for robust small/large polyp handling.
 
-    def __init__(self, in_channels: int = 3, hidden_channels: int = 16):
+    Inputs are branch logits stacked as (B, 3, H, W) in the order:
+    [VM-UNet(Mamba), TransFuse(Transformer), ResUNet++(CNN)].
+    """
+
+    def __init__(self, in_branches: int = 3, hidden_channels: int = 32):
         super().__init__()
-        self.scale_1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, dilation=1)
-        self.scale_2 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=2, dilation=2)
-        self.scale_3 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=3, dilation=3)
-        self.reweight = nn.Sequential(
-            nn.Conv2d(hidden_channels * 3, hidden_channels, kernel_size=1),
+        self.in_branches = in_branches
+
+        # Learns pixel-wise scale preferences (fine/mid/coarse).
+        self.scale_gate = nn.Sequential(
+            nn.Conv2d(in_branches * 3, hidden_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(hidden_channels, 3, kernel_size=1),
         )
 
-    def forward(self, stack: torch.Tensor) -> torch.Tensor:
-        s1 = F.relu(self.scale_1(stack), inplace=True)
-        s2 = F.relu(self.scale_2(stack), inplace=True)
-        s3 = F.relu(self.scale_3(stack), inplace=True)
+        # Learns pixel-wise branch preferences after scale aggregation.
+        self.branch_gate = nn.Sequential(
+            nn.Conv2d(in_branches, hidden_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, in_branches, kernel_size=1),
+        )
 
-        multi = torch.cat([s1, s2, s3], dim=1)
-        alpha = torch.softmax(self.reweight(multi), dim=1)
-        fused = (alpha * stack).sum(dim=1, keepdim=True)
-        return fused
+        # Optional residual refinement for sharper boundaries.
+        self.refine = nn.Sequential(
+            nn.Conv2d(1, hidden_channels // 2, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels // 2, 1, kernel_size=1),
+        )
+
+    @staticmethod
+    def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        return F.interpolate(x, size=ref.shape[-2:], mode="bilinear", align_corners=False)
+
+    def _scale_pyramid(self, stack: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fine = stack
+        mid = self._resize_like(F.avg_pool2d(stack, kernel_size=2, stride=2), stack)
+        coarse = self._resize_like(F.avg_pool2d(stack, kernel_size=4, stride=4), stack)
+        return fine, mid, coarse
+
+    def forward(self, stack: torch.Tensor) -> torch.Tensor:
+        fine, mid, coarse = self._scale_pyramid(stack)
+
+        scale_logits = self.scale_gate(torch.cat([fine, mid, coarse], dim=1))
+        scale_weights = torch.softmax(scale_logits, dim=1)
+
+        scale_agg = (
+            scale_weights[:, 0:1] * fine
+            + scale_weights[:, 1:2] * mid
+            + scale_weights[:, 2:3] * coarse
+        )
+
+        branch_logits = self.branch_gate(scale_agg)
+        branch_weights = torch.softmax(branch_logits, dim=1)
+        fused = (branch_weights * scale_agg).sum(dim=1, keepdim=True)
+        return fused + self.refine(fused)
 
 
 class MambaFusionEnsemble(nn.Module):
@@ -44,15 +79,18 @@ class MambaFusionEnsemble(nn.Module):
             for p in m.parameters():
                 p.requires_grad = False
 
-        self.cross_scale_fusion = CrossScaleFusionModule(in_channels=3, hidden_channels=24)
+        self.cross_scale_fusion = CrossScaleGatedFusionModule(in_branches=3, hidden_channels=32)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_branch_logits(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         with torch.no_grad():
             m = ensure_binary_output(self.mamba(x))
             t = ensure_binary_output(self.transfuse(x))
             r = ensure_binary_output(self.resunetpp(x))
+        return {"mamba": m, "transformer": t, "cnn": r}
 
-        stack = torch.cat([m, t, r], dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        branches = self.forward_branch_logits(x)
+        stack = torch.cat([branches["mamba"], branches["transformer"], branches["cnn"]], dim=1)
         return self.cross_scale_fusion(stack)
 
 

@@ -1,38 +1,40 @@
 # Mamba-Fusion for Polyp Segmentation
 
-This repository provides a research-focused implementation for a **Mamba-Fusion** segmentation ensemble:
+This repository now targets a **high-impact-journal-ready** workflow for colonoscopy polyp segmentation.
 
-- **VM-UNet (Mamba-style branch)**
-- **TransFuse (transformer-guided branch)**
-- **ResUNet++ (CNN branch)**
-- **Cross-Scale Fusion Module** for scale-robust polyp prediction
+## 1) Proposed novelty
 
-## Why this setup is publishable
+**Mamba-Fusion = Triple-paradigm ensemble + Cross-Scale Gated Fusion**
 
-1. **Architecture novelty**: combines three complementary branches with an explicit cross-scale fusion head.
-2. **Clinical challenge targeted**: scale variation in polyps is handled using multi-dilation adaptive fusion.
-3. **Explainability (XAI)**: Grad-CAM utilities are included for qualitative justification in manuscript figures.
-4. **Cross-dataset protocol**: designed to report out-of-distribution performance (e.g., train Kvasir-SEG and test ETIS / CVC-ClinicDB without retraining).
+- **VM-UNet (Mamba)** branch: efficient sequence/state modeling.
+- **TransFuse (Transformer)** branch: global contextual reasoning.
+- **ResUNet++ (CNN)** branch: local edge and boundary precision.
+- **Cross-Scale Gated Fusion Module (CSFM)**: explicit scale-aware gating to handle tiny, medium, and large polyps.
 
-## Suggested experimental protocol
+This "committee of experts" design is intended to combine local, global, and efficient long-context behavior in one framework.
 
-1. Train each base model on Kvasir-SEG train split.
-2. Freeze the base models and train `MambaFusionEnsemble` fusion module.
-3. Evaluate on:
-   - Kvasir held-out test split (in-distribution)
-   - CVC-ClinicDB / ETIS-Larib (cross-dataset generalization)
-4. Report Dice, IoU, Precision, Recall, Accuracy.
-5. Include Grad-CAM visualizations for successful and failure cases.
-
-## Core files
+## 2) What is implemented
 
 - `models/vmunet_mamba.py`: VM-UNet style Mamba branch.
-- `models/transfuse.py`: TransFuse branch.
-- `models/resunetpp.py`: ResUNet++ wrapper branch.
-- `ensemble.py`: Mamba-Fusion ensemble and Cross-Scale Fusion Module.
-- `xai.py`: Grad-CAM and heatmap overlay utilities.
+- `models/transfuse.py`: Transformer-guided branch.
+- `models/resunetpp.py` + `resunet++_kvasir.py`: CNN branch.
+- `ensemble.py`: `MambaFusionEnsemble` with `CrossScaleGatedFusionModule`.
+- `xai.py`: branchwise Grad-CAM, Mamba state-response proxy, consensus/disagreement maps.
+- `docs/PUBLICATION_PROTOCOL.md`: submission-grade experimental roadmap.
+- `research_readiness.py`: lightweight architecture verification script.
 
-## Minimal usage sketch
+## 3) Journal-oriented evaluation protocol
+
+Follow `docs/PUBLICATION_PROTOCOL.md` exactly.
+
+Minimum requirement:
+
+1. Train on **Kvasir-SEG + CVC-ClinicDB**.
+2. Validate on held-out internal splits.
+3. Report **zero-shot external test** on **ETIS-Larib / CVC-ColonDB**.
+4. Include branch-level explainability and failure-case analysis.
+
+## 4) Quick start
 
 ```python
 from models import VMUNetMamba, TransFuse, ResUNetPPWrapper
@@ -41,14 +43,31 @@ from ensemble import MambaFusionEnsemble
 mamba = VMUNetMamba(out_size=256, pretrained=True)
 transfuse = TransFuse(out_size=256, pretrained=True)
 resunet = ResUNetPPWrapper("resunet++_kvasir.py", out_size=256)
-
 model = MambaFusionEnsemble(mamba, transfuse, resunet)
 ```
 
-## Reproducibility checklist for paper submission
+## 5) Sanity check command
 
-- Fix random seed and document compute platform.
-- Report number of parameters and FPS for each branch + ensemble.
-- Include cross-dataset statistics with confidence intervals.
-- Provide qualitative XAI maps and failure-case analysis.
-- Publish code and checkpoint hashes.
+```bash
+python research_readiness.py
+```
+
+> Note: this verifies architectural claims, not publication acceptance. Acceptance depends on rigorous experiments, statistical significance, and manuscript quality.
+
+
+## 6) Produce publication tables from your experiment outputs
+
+After running experiments and saving JSON metrics, build manuscript-ready tables:
+
+```bash
+python publication_results.py   --inputs outputs/metrics_kvasir.json outputs/metrics_etis.json outputs/metrics_colondb.json   --output-dir outputs/publication_bundle
+```
+
+Generated artifacts:
+- `all_results_raw.csv`
+- `table_main_results.csv`
+- `table_external_generalization.csv`
+- `table_main_results.tex` (LaTeX)
+- `RESULTS_SUMMARY.md`
+
+Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal format.

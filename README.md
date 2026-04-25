@@ -71,3 +71,8 @@ Generated artifacts:
 - `RESULTS_SUMMARY.md`
 
 Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal format.
+
+
+## 7) Colab one-cell execution
+
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, runs readiness checks, and optionally builds the publication result bundle.

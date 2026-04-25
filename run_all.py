@@ -74,7 +74,9 @@ def main():
             "or use --auto-discover-metrics --metrics-dir <dir>."
         )
         if args.require_metrics:
-            raise RuntimeError(msg)
+            print(f"[ERROR] {msg}")
+            print("[HINT] Set --metrics-json explicitly or disable strict mode by removing --require-metrics.")
+            sys.exit(2)
         print(f"[INFO] {msg}")
 
     print("\n[DONE] run_all.py completed.")

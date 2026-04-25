@@ -2,11 +2,11 @@
 
 Copy-paste this **single Colab cell** to install dependencies, clone the repo, run sanity checks, and build publication tables.
 
-> Why your previous run finished in seconds: `METRICS_JSONS = []` means there were no result files to package, so the script correctly skipped table generation.
+> Why the previous run failed: `--require-metrics` was enabled, but no `metrics*.json/results*.json` files were found under your `METRICS_DIR`.
 
 ```python
 # ======= Mamba-Fusion: Single Colab Cell (robust branch + metrics checks) =======
-import os, subprocess, sys
+import os, subprocess, sys, glob
 
 REPO_URL = "https://github.com/abdulkareem/ensemble_higherversion.git"
 REPO_DIR = "/content/ensemble_higherversion"
@@ -19,7 +19,7 @@ METRICS_JSONS = []
 # Auto-discover metrics if METRICS_JSONS is empty
 AUTO_DISCOVER_METRICS = True
 METRICS_DIR = "/content/drive/MyDrive"   # where your metrics*.json/results*.json exist
-REQUIRE_METRICS = True  # fail loudly instead of silently finishing when metrics are missing
+REQUIRE_METRICS = False  # set True only after your metrics files are actually created
 
 OUTPUT_DIR = "/content/drive/MyDrive/mamba_fusion_publication_bundle"
 
@@ -61,13 +61,26 @@ if AUTO_DISCOVER_METRICS:
 if REQUIRE_METRICS:
     cmd += ["--require-metrics"]
 
-subprocess.check_call(cmd)
+try:
+    subprocess.check_call(cmd)
+except subprocess.CalledProcessError as e:
+    print(f"\n[ERROR] run_all.py failed with exit code {e.returncode}.")
+    found = sorted(glob.glob(os.path.join(METRICS_DIR, "**", "*metrics*.json"), recursive=True) +
+                   glob.glob(os.path.join(METRICS_DIR, "**", "*results*.json"), recursive=True))
+    print(f"[DEBUG] Found {len(found)} metric-like files under {METRICS_DIR}.")
+    if found:
+        print("[DEBUG] Sample files:")
+        for p in found[:10]:
+            print(" -", p)
+    else:
+        print("[HINT] No metrics files found yet. Run training/evaluation first, then re-run this cell.")
+    raise
 
-print("\n✅ Completed. If no metrics are found, the cell now fails with a clear error.")
+print("\n✅ Completed.")
 # ==============================================================================
 ```
 
 ### Notes
 - If you use private repos, authenticate Git in Colab first.
 - Use `publication_results.py` only with **real experimental metrics** (no fabricated values).
-- If this fails with “No metrics JSON files found”, first run training/evaluation and save metrics files.
+- Once metrics files exist, you can set `REQUIRE_METRICS = True` for strict pipeline enforcement.

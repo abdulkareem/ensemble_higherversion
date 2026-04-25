@@ -3,45 +3,76 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils import compute_metrics_from_logits, dice_bce_loss, ensure_binary_output
 
 
-class WeightedEnsemble(nn.Module):
-    def __init__(self, resunetpp: nn.Module, transfuse: nn.Module, wdffnet: nn.Module):
+class CrossScaleFusionModule(nn.Module):
+    """Adaptive multi-scale fusion to address polyp size variation."""
+
+    def __init__(self, in_channels: int = 3, hidden_channels: int = 16):
         super().__init__()
-        self.r = resunetpp.eval()
-        self.t = transfuse.eval()
-        self.w = wdffnet.eval()
-
-        for m in [self.r, self.t, self.w]:
-            for p in m.parameters():
-                p.requires_grad = False
-
-        self.weight_head = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        self.scale_1 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, dilation=1)
+        self.scale_2 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=2, dilation=2)
+        self.scale_3 = nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=3, dilation=3)
+        self.reweight = nn.Sequential(
+            nn.Conv2d(hidden_channels * 3, hidden_channels, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(16, 3, kernel_size=1),
+            nn.Conv2d(hidden_channels, 3, kernel_size=1),
         )
 
-    def forward(self, x: torch.Tensor):
-        with torch.no_grad():
-            r = ensure_binary_output(self.r(x))
-            t = ensure_binary_output(self.t(x))
-            w = ensure_binary_output(self.w(x))
+    def forward(self, stack: torch.Tensor) -> torch.Tensor:
+        s1 = F.relu(self.scale_1(stack), inplace=True)
+        s2 = F.relu(self.scale_2(stack), inplace=True)
+        s3 = F.relu(self.scale_3(stack), inplace=True)
 
-        stack = torch.cat([r, t, w], dim=1)
-        weights = torch.softmax(self.weight_head(stack), dim=1)
-        fused = (weights * stack).sum(dim=1, keepdim=True)
+        multi = torch.cat([s1, s2, s3], dim=1)
+        alpha = torch.softmax(self.reweight(multi), dim=1)
+        fused = (alpha * stack).sum(dim=1, keepdim=True)
         return fused
 
 
-def train_ensemble_head(model: WeightedEnsemble, train_loader, val_loader, device: torch.device, epochs: int = 10, lr: float = 1e-4):
+class MambaFusionEnsemble(nn.Module):
+    def __init__(self, vm_unet_mamba: nn.Module, transfuse: nn.Module, resunetpp: nn.Module):
+        super().__init__()
+        self.mamba = vm_unet_mamba.eval()
+        self.transfuse = transfuse.eval()
+        self.resunetpp = resunetpp.eval()
+
+        for m in [self.mamba, self.transfuse, self.resunetpp]:
+            for p in m.parameters():
+                p.requires_grad = False
+
+        self.cross_scale_fusion = CrossScaleFusionModule(in_channels=3, hidden_channels=24)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            m = ensure_binary_output(self.mamba(x))
+            t = ensure_binary_output(self.transfuse(x))
+            r = ensure_binary_output(self.resunetpp(x))
+
+        stack = torch.cat([m, t, r], dim=1)
+        return self.cross_scale_fusion(stack)
+
+
+# Backward-compatible alias for older scripts.
+WeightedEnsemble = MambaFusionEnsemble
+
+
+def train_ensemble_head(
+    model: MambaFusionEnsemble,
+    train_loader,
+    val_loader,
+    device: torch.device,
+    epochs: int = 10,
+    lr: float = 1e-4,
+):
     model.to(device)
-    optimizer = torch.optim.Adam(model.weight_head.parameters(), lr=lr)
-    history = {"train_loss": [], "val_dice": []}
+    optimizer = torch.optim.Adam(model.cross_scale_fusion.parameters(), lr=lr)
+    history: Dict[str, list] = {"train_loss": [], "val_dice": []}
     best_dice = -1.0
-    best_path = "best_ensemble.pth"
+    best_path = "best_mamba_fusion_ensemble.pth"
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -67,7 +98,7 @@ def train_ensemble_head(model: WeightedEnsemble, train_loader, val_loader, devic
         val_dice = float(np.mean(dices))
         history["train_loss"].append(train_loss)
         history["val_dice"].append(val_dice)
-        print(f"[Ensemble] Epoch {ep}/{epochs} | loss={train_loss:.4f} | val_dice={val_dice:.4f}")
+        print(f"[Mamba-Fusion] Epoch {ep}/{epochs} | loss={train_loss:.4f} | val_dice={val_dice:.4f}")
 
         if val_dice > best_dice:
             best_dice = val_dice

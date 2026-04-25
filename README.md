@@ -53,3 +53,21 @@ python research_readiness.py
 ```
 
 > Note: this verifies architectural claims, not publication acceptance. Acceptance depends on rigorous experiments, statistical significance, and manuscript quality.
+
+
+## 6) Produce publication tables from your experiment outputs
+
+After running experiments and saving JSON metrics, build manuscript-ready tables:
+
+```bash
+python publication_results.py   --inputs outputs/metrics_kvasir.json outputs/metrics_etis.json outputs/metrics_colondb.json   --output-dir outputs/publication_bundle
+```
+
+Generated artifacts:
+- `all_results_raw.csv`
+- `table_main_results.csv`
+- `table_external_generalization.csv`
+- `table_main_results.tex` (LaTeX)
+- `RESULTS_SUMMARY.md`
+
+Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal format.

@@ -75,8 +75,32 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` in strict mode so missing metrics do not silently pass.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with branch fallback and metric auto-discovery; you can choose strict or non-strict behavior via `ALLOW_EMPTY_METRICS`.
 
 ## 8) Kaggle one-cell execution
 
 Use `KAGGLE_SINGLE_CELL.md` for Kaggle-compatible execution with network-resilient behavior (best-effort pip/git and offline guidance).
+
+
+## 9) Quick troubleshooting (Colab/Kaggle)
+
+If you see:
+`CalledProcessError: ... git checkout work ... returned non-zero exit status 1`
+then branch `work` does not exist in the remote repo.
+
+Fix:
+- set `BRANCH = "main"`, or
+- set `BRANCH` to an existing remote branch name.
+
+The provided `COLAB_SINGLE_CELL.md` already includes fallback logic (`BRANCH` -> `origin/BRANCH` -> remote default branch).
+
+
+### Journal-quality mode
+
+Use strict quality gating when preparing submission tables:
+
+```bash
+python publication_results.py   --inputs outputs/metrics_run1.json outputs/metrics_run2.json outputs/metrics_run3.json   --output-dir outputs/publication_bundle   --min-runs-per-model 3   --min-external-datasets 1   --strict-journal-quality
+```
+
+This generates `journal_quality_check.json` and fails if minimum repeated runs or external validation requirements are not met.

@@ -49,3 +49,10 @@ Required examples:
 - low-contrast polyp,
 - specular highlight artifact,
 - motion blur frame.
+
+
+## 7. Journal-quality gate
+
+- Run `publication_results.py` with repeated-run inputs and inspect `journal_quality_check.json`.
+- For strict enforcement use: `--strict-journal-quality --min-runs-per-model 3 --min-external-datasets 1`.
+- Only claim "journal quality" when this check passes and qualitative/XAI evidence is complete.

@@ -93,3 +93,14 @@ Fix:
 - set `BRANCH` to an existing remote branch name.
 
 The provided `COLAB_SINGLE_CELL.md` already includes fallback logic (`BRANCH` -> `origin/BRANCH` -> remote default branch).
+
+
+### Journal-quality mode
+
+Use strict quality gating when preparing submission tables:
+
+```bash
+python publication_results.py   --inputs outputs/metrics_run1.json outputs/metrics_run2.json outputs/metrics_run3.json   --output-dir outputs/publication_bundle   --min-runs-per-model 3   --min-external-datasets 1   --strict-journal-quality
+```
+
+This generates `journal_quality_check.json` and fails if minimum repeated runs or external validation requirements are not met.

@@ -154,3 +154,21 @@ print("\n✅ Training + publication packaging completed.")
 print("Outputs saved to:", OUTPUT_DIR)
 print("Model stats saved to:", os.path.join(OUTPUT_DIR, "model_stats.json"))
 ```
+
+
+### After training: generate image comparison figures
+
+Run this in a new Colab cell after training:
+
+```python
+fig_dir = os.path.join(OUTPUT_DIR, "figures")
+subprocess.check_call([
+    sys.executable, "generate_publication_figures.py",
+    "--metrics-json", os.path.join(OUTPUT_DIR, "metrics_internal.json"),
+    "--data-dir", TRAIN_DATA_DIRS[0],
+    "--output-dir", fig_dir,
+    "--image-size", str(IMAGE_SIZE),
+    "--num-samples", "6",
+])
+print("Figure outputs:", fig_dir)
+```

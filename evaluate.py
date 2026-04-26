@@ -11,7 +11,7 @@ from tabulate import tabulate
 
 from utils import compute_metrics_from_logits, ensure_binary_output
 
-DEFAULT_OUTPUT_DIR = "/content/drive/MyDrive/ensemble_outputs"
+DEFAULT_OUTPUT_DIR = "outputs"
 
 
 def force_colab_inline() -> None:

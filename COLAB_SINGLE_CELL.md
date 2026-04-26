@@ -4,7 +4,7 @@ Copy-paste this **single Colab cell** to install dependencies, clone the repo, r
 
 > If you get `CalledProcessError` on `git checkout work`, set `BRANCH = "main"` (or any branch that exists remotely).
 
-> If it used to finish in seconds, it was because no metrics files were found. This version defaults to **failing** when metrics are absent (so you don't get a false "Completed").
+> If no metrics files exist yet, this cell can run in non-strict mode and finish with a warning (no publication bundle generated).
 
 ```python
 # ======= Mamba-Fusion: Single Colab Cell (robust branch + strict metrics checks) =======
@@ -21,7 +21,7 @@ METRICS_JSONS = []
 # Auto-discover metrics if METRICS_JSONS is empty
 AUTO_DISCOVER_METRICS = True
 METRICS_DIR = "/content/drive/MyDrive"   # where your metrics*.json/results*.json exist
-ALLOW_EMPTY_METRICS = False  # False => fail if no metrics found (recommended)
+ALLOW_EMPTY_METRICS = True  # True => no error when metrics are not available yet
 
 OUTPUT_DIR = "/content/drive/MyDrive/mamba_fusion_publication_bundle"
 
@@ -78,7 +78,7 @@ except subprocess.CalledProcessError as e:
         print("[HINT] No metrics files found yet. Run training/evaluation first, then re-run this cell.")
     raise
 
-print("\n✅ Completed with publication bundle generated.")
+print("\n✅ Completed. If metrics were found, publication bundle was generated.")
 # ==============================================================================
 ```
 

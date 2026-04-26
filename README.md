@@ -75,7 +75,7 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that mounts Google Drive, can auto-download Kvasir-SEG if needed, enforces uniform training settings for fair model comparison, and writes publication outputs + model stats to Drive with clearer error diagnostics.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that mounts Google Drive, can auto-download Kvasir-SEG if needed, enforces uniform training settings for fair model comparison, and writes publication outputs + model stats to Drive with clearer error diagnostics. The cell is backward-compatible with both older (`--data-dir`) and newer (`--train-data-dirs`) `train_all.py` signatures.
 
 ## 8) Kaggle one-cell execution
 

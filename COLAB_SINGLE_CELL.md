@@ -94,18 +94,37 @@ for d in TRAIN_DATA_DIRS:
         raise FileNotFoundError(f"Dataset {d} must contain 'images/' and 'masks/' folders.")
 
 # 5) Train all models + ensemble (uniform settings)
-cmd = [
-    sys.executable, "train_all.py",
-    "--train-data-dirs", *TRAIN_DATA_DIRS,
-    "--output-dir", OUTPUT_DIR,
-    "--base-epochs", str(BASE_EPOCHS),
-    "--ensemble-epochs", str(ENSEMBLE_EPOCHS),
-    "--batch-size", str(BATCH_SIZE),
-    "--image-size", str(IMAGE_SIZE),
-    "--num-workers", str(NUM_WORKERS),
-    "--seed", str(SEED),
-    "--lr", str(LR),
-]
+help_text = subprocess.check_output([sys.executable, "train_all.py", "--help"], text=True)
+
+if "--train-data-dirs" in help_text:
+    # New pipeline (joint training across multiple datasets)
+    cmd = [
+        sys.executable, "train_all.py",
+        "--train-data-dirs", *TRAIN_DATA_DIRS,
+        "--output-dir", OUTPUT_DIR,
+        "--base-epochs", str(BASE_EPOCHS),
+        "--ensemble-epochs", str(ENSEMBLE_EPOCHS),
+        "--batch-size", str(BATCH_SIZE),
+        "--image-size", str(IMAGE_SIZE),
+        "--num-workers", str(NUM_WORKERS),
+        "--seed", str(SEED),
+        "--lr", str(LR),
+    ]
+else:
+    # Backward-compatible fallback for older train_all.py requiring --data-dir
+    cmd = [
+        sys.executable, "train_all.py",
+        "--data-dir", TRAIN_DATA_DIRS[0],
+        "--output-dir", OUTPUT_DIR,
+        "--base-epochs", str(BASE_EPOCHS),
+        "--ensemble-epochs", str(ENSEMBLE_EPOCHS),
+        "--batch-size", str(BATCH_SIZE),
+        "--image-size", str(IMAGE_SIZE),
+        "--num-workers", str(NUM_WORKERS),
+        "--seed", str(SEED),
+        "--lr", str(LR),
+    ]
+
 if EXTERNAL_DATA_DIR:
     cmd += ["--external-data-dir", EXTERNAL_DATA_DIR]
 

@@ -123,3 +123,9 @@ python generate_publication_figures.py \
 ```
 
 This creates `metrics_bar_dice_iou.png` and `qualitative_comparison_grid.png` for manuscript figures.
+
+
+### Zero-shot publication standard
+
+For stronger publication claims, include **both ETIS-Larib and CVC-ColonDB** as external zero-shot datasets.
+When using `publication_results.py`, set `--min-external-datasets 2`.

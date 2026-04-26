@@ -13,7 +13,7 @@
 |---|---|---|
 | Training | Kvasir-SEG + CVC-ClinicDB | learn robust base representations |
 | Internal test | held-out 20% from training pool | primary accuracy benchmarking |
-| External zero-shot | ETIS-Larib and/or CVC-ColonDB | prove domain generalization without retraining |
+| External zero-shot | ETIS-Larib and CVC-ColonDB | prove domain generalization without retraining |
 
 ## Reporting requirements
 

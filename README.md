@@ -75,7 +75,7 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with branch fallback and metric auto-discovery; you can choose strict or non-strict behavior via `ALLOW_EMPTY_METRICS`.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with branch fallback and metric auto-discovery; it now clearly reports whether a publication bundle was generated or only a sanity run was performed.
 
 ## 8) Kaggle one-cell execution
 

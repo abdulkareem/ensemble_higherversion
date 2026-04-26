@@ -78,7 +78,11 @@ except subprocess.CalledProcessError as e:
         print("[HINT] No metrics files found yet. Run training/evaluation first, then re-run this cell.")
     raise
 
-print("\n✅ Completed. If metrics were found, publication bundle was generated.")
+bundle_file = os.path.join(OUTPUT_DIR, "table_main_results.csv")
+if os.path.exists(bundle_file):
+    print(f"\n✅ Completed with publication bundle: {bundle_file}")
+else:
+    print("\n⚠️ Completed sanity run only. No metrics JSON found, so no publication bundle was generated.")
 # ==============================================================================
 ```
 

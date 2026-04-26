@@ -11,7 +11,8 @@ if not os.path.exists(REPO_DIR):
     subprocess.check_call(["git", "clone", REPO_URL, REPO_DIR])
 
 %cd /content/ensemble_higherversion
-!python COLAB_SINGLE_CELL.py
+!ls -l /content/ensemble_higherversion/COLAB_SINGLE_CELL.py
+!python /content/ensemble_higherversion/COLAB_SINGLE_CELL.py
 ```
 
 > If you see `SyntaxError` near ``` in a notebook cell, you likely pasted markdown fences. Use `!python COLAB_SINGLE_CELL.py` instead.

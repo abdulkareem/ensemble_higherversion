@@ -75,7 +75,7 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that trains all base models + ensemble head, generates publication tables, and writes outputs directly to Google Drive.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that mounts Google Drive, performs preflight dataset checks (`images/` + `masks/`), trains all base models + ensemble head, and writes publication outputs to Drive with clearer error diagnostics.
 
 ## 8) Kaggle one-cell execution
 

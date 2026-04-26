@@ -1,15 +1,23 @@
 # Colab Single-Cell Runner (Train All + Publishable Outputs)
 
 This cell will:
-1. install deps,
-2. clone/update repo,
-3. train **VMUNetMamba**, **TransFuse**, **ResUNet++**,
-4. train **Mamba-Fusion ensemble head**,
-5. generate publication tables,
-6. save everything in Google Drive.
+1. mount Google Drive,
+2. install deps,
+3. clone/update repo,
+4. train **VMUNetMamba**, **TransFuse**, **ResUNet++**,
+5. train **Mamba-Fusion ensemble head**,
+6. generate publication tables,
+7. save everything in Google Drive.
 
 ```python
 import os, subprocess, sys
+
+# Optional: mount Drive if not mounted already
+try:
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+except Exception as e:
+    print('[WARN] Could not mount Google Drive automatically:', e)
 
 REPO_URL = "https://github.com/abdulkareem/ensemble_higherversion.git"
 REPO_DIR = "/content/ensemble_higherversion"
@@ -58,7 +66,15 @@ if not checkout_ok:
 
 os.chdir(REPO_DIR)
 
-# 3) Train all models + ensemble
+# 3) Preflight checks (avoids vague exit code 2)
+if not os.path.exists("train_all.py"):
+    raise FileNotFoundError("train_all.py not found. Check REPO_DIR/branch checkout.")
+if not os.path.isdir(DATA_DIR):
+    raise FileNotFoundError(f"DATA_DIR not found: {DATA_DIR}")
+if not os.path.isdir(os.path.join(DATA_DIR, "images")) or not os.path.isdir(os.path.join(DATA_DIR, "masks")):
+    raise FileNotFoundError("DATA_DIR must contain 'images/' and 'masks/' folders.")
+
+# 4) Train all models + ensemble
 cmd = [
     sys.executable, "train_all.py",
     "--data-dir", DATA_DIR,
@@ -72,12 +88,16 @@ cmd = [
 ]
 if EXTERNAL_DATA_DIR:
     cmd += ["--external-data-dir", EXTERNAL_DATA_DIR]
-subprocess.check_call(cmd)
 
-# 4) Build publishable tables
-metric_files = [
-    os.path.join(OUTPUT_DIR, "metrics_internal.json"),
-]
+proc = subprocess.run(cmd, text=True, capture_output=True)
+if proc.returncode != 0:
+    print("\n[ERROR] train_all.py failed.")
+    print("[STDOUT]\n", proc.stdout[-4000:])
+    print("[STDERR]\n", proc.stderr[-4000:])
+    raise RuntimeError(f"train_all.py failed with exit code {proc.returncode}")
+
+# 5) Build publishable tables
+metric_files = [os.path.join(OUTPUT_DIR, "metrics_internal.json")]
 ext_file = os.path.join(OUTPUT_DIR, "metrics_external.json")
 if os.path.exists(ext_file):
     metric_files.append(ext_file)

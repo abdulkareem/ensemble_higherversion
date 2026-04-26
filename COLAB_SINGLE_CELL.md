@@ -1,5 +1,19 @@
 # Colab Single-Cell Runner (Train All + Publishable Outputs)
 
+## Quick bootstrap (run this first in Colab)
+
+```python
+import os, subprocess
+REPO_URL = "https://github.com/abdulkareem/ensemble_higherversion.git"
+REPO_DIR = "/content/ensemble_higherversion"
+
+if not os.path.exists(REPO_DIR):
+    subprocess.check_call(["git", "clone", REPO_URL, REPO_DIR])
+
+%cd /content/ensemble_higherversion
+!python COLAB_SINGLE_CELL.py
+```
+
 > If you see `SyntaxError` near ``` in a notebook cell, you likely pasted markdown fences. Use `!python COLAB_SINGLE_CELL.py` instead.
 
 This cell will:

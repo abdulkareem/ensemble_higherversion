@@ -75,7 +75,7 @@ Use `docs/RESULTS_REPORTING_TEMPLATE.md` to draft the Results section in journal
 
 ## 7) Colab one-cell execution
 
-Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that installs dependencies, clones the repo, auto-falls back to the remote default branch if needed, and runs `run_all.py` with branch fallback and metric auto-discovery; you can choose strict or non-strict behavior via `ALLOW_EMPTY_METRICS`.
+Use `COLAB_SINGLE_CELL.md` for a single-cell Colab runner that trains all base models + ensemble head, generates publication tables, and writes outputs directly to Google Drive.
 
 ## 8) Kaggle one-cell execution
 
@@ -104,3 +104,8 @@ python publication_results.py   --inputs outputs/metrics_run1.json outputs/metri
 ```
 
 This generates `journal_quality_check.json` and fails if minimum repeated runs or external validation requirements are not met.
+
+
+### Recommended journal training depth
+
+For high-impact submissions, run at least **50 epochs** for each base model and **50 epochs** for the ensemble head (or justify early stopping with validation curves).

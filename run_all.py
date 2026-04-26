@@ -54,6 +54,8 @@ def main():
 
     metrics = sorted(set(metrics))
 
+    bundle_generated = False
+
     if metrics:
         missing = [m for m in metrics if not Path(m).exists()]
         if missing:
@@ -67,6 +69,7 @@ def main():
             "--output-dir",
             args.output_dir,
         ])
+        bundle_generated = True
     else:
         msg = (
             "No metrics JSON files found. Provide --metrics-json <files>, "
@@ -80,7 +83,10 @@ def main():
             print("[HINT] Generate evaluation metrics first, then rerun this command.")
             sys.exit(2)
 
-    print("\n[DONE] run_all.py completed.")
+    if bundle_generated:
+        print("\n[DONE] run_all.py completed. Publication bundle generated.")
+    else:
+        print("\n[DONE] run_all.py completed. No publication bundle was generated (metrics missing).")
 
 
 if __name__ == "__main__":

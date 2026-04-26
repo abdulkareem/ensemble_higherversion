@@ -98,7 +98,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train all models + ensemble and export publication-ready metrics.")
     p.add_argument("--data-dir", default="", help="Single primary dataset root (images/ and masks/).")
     p.add_argument("--train-data-dirs", nargs="*", default=[], help="Multiple dataset roots for joint training (recommended).")
-    p.add_argument("--external-data-dir", default="", help="Optional external dataset for zero-shot evaluation.")
+    p.add_argument("--external-data-dir", default="", help="Optional single external dataset for zero-shot evaluation.")
+    p.add_argument("--external-data-dirs", nargs="*", default=[], help="Optional multiple external datasets for zero-shot evaluation.")
     p.add_argument("--output-dir", default="outputs/full_run", help="Directory for checkpoints and metric files.")
     p.add_argument("--image-size", type=int, default=256)
     p.add_argument("--batch-size", type=int, default=8)
@@ -189,17 +190,24 @@ def main():
     }
     (out / "metrics_internal.json").write_text(json.dumps(internal_payload, indent=2), encoding="utf-8")
 
+    external_dirs = list(args.external_data_dirs)
     if args.external_data_dir:
-        print(f"[INFO] Evaluating external dataset: {args.external_data_dir}")
-        ext_loader = _external_loader(args.external_data_dir, args.image_size, args.batch_size, args.num_workers)
+        external_dirs.append(args.external_data_dir)
+    external_dirs = [d for d in dict.fromkeys(external_dirs) if d]
+
+    for ext_dir in external_dirs:
+        print(f"[INFO] Evaluating external dataset: {ext_dir}")
+        ext_loader = _external_loader(ext_dir, args.image_size, args.batch_size, args.num_workers)
         external_metrics = _evaluate_all(models, ext_loader, device)
+        ds_name = Path(ext_dir).name
         external_payload = {
-            "dataset": Path(args.external_data_dir).name,
+            "dataset": ds_name,
             "run_id": f"seed_{args.seed}",
             "metrics_by_model": external_metrics,
             "uniform_training_config": uniform_training_config,
         }
-        (out / "metrics_external.json").write_text(json.dumps(external_payload, indent=2), encoding="utf-8")
+        safe_name = ds_name.lower().replace(" ", "_")
+        (out / f"metrics_external_{safe_name}.json").write_text(json.dumps(external_payload, indent=2), encoding="utf-8")
 
     print(f"[DONE] Training and evaluation complete. Outputs in: {out}")
 

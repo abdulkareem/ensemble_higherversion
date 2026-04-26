@@ -109,3 +109,23 @@ This generates `journal_quality_check.json` and fails if minimum repeated runs o
 ### Recommended journal training depth
 
 For high-impact submissions, run at least **50 epochs** for each base model and **50 epochs** for the ensemble head (or justify early stopping with validation curves).
+
+
+### Publication figure generation
+
+After training, generate comparison charts and qualitative image grids:
+
+```bash
+python generate_publication_figures.py \
+  --metrics-json /path/to/metrics_internal.json \
+  --data-dir /path/to/dataset \
+  --output-dir /path/to/output/figures
+```
+
+This creates `metrics_bar_dice_iou.png` and `qualitative_comparison_grid.png` for manuscript figures.
+
+
+### Zero-shot publication standard
+
+For stronger publication claims, include **both ETIS-Larib and CVC-ColonDB** as external zero-shot datasets.
+When using `publication_results.py`, set `--min-external-datasets 2`.

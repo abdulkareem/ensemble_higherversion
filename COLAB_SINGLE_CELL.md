@@ -33,8 +33,10 @@ AUTO_DOWNLOAD_KVASIR = True
 KVASIR_ZIP_URL = "https://datasets.simula.no/downloads/kvasir-seg.zip"
 KVASIR_FALLBACK_DIR = "/content/data/Kvasir-SEG"
 
-# Optional external dataset for zero-shot testing (same folder structure)
-EXTERNAL_DATA_DIR = ""  # e.g. "/content/drive/MyDrive/ETIS-Larib"
+# Optional external datasets for zero-shot testing (same folder structure)
+ETIS_DIR = ""      # e.g. "/content/drive/MyDrive/ETIS-Larib"
+COLONDB_DIR = ""   # e.g. "/content/drive/MyDrive/CVC-ColonDB"
+EXTERNAL_DATA_DIRS = [d for d in [ETIS_DIR, COLONDB_DIR] if d]
 
 OUTPUT_DIR = "/content/drive/MyDrive/mamba_fusion_publication_bundle"
 
@@ -125,8 +127,8 @@ else:
         "--lr", str(LR),
     ]
 
-if EXTERNAL_DATA_DIR:
-    cmd += ["--external-data-dir", EXTERNAL_DATA_DIR]
+if EXTERNAL_DATA_DIRS:
+    cmd += ["--external-data-dirs", *EXTERNAL_DATA_DIRS]
 
 proc = subprocess.run(cmd, text=True, capture_output=True)
 if proc.returncode != 0:
@@ -136,21 +138,38 @@ if proc.returncode != 0:
     raise RuntimeError(f"train_all.py failed with exit code {proc.returncode}")
 
 # 6) Build publishable tables
+import glob
 metric_files = [os.path.join(OUTPUT_DIR, "metrics_internal.json")]
-ext_file = os.path.join(OUTPUT_DIR, "metrics_external.json")
-if os.path.exists(ext_file):
-    metric_files.append(ext_file)
+metric_files += sorted(glob.glob(os.path.join(OUTPUT_DIR, "metrics_external_*.json")))
 
 cmd_pub = [
     sys.executable, "publication_results.py",
     "--inputs", *metric_files,
     "--output-dir", OUTPUT_DIR,
     "--min-runs-per-model", "1",
-    "--min-external-datasets", "1",
+    "--min-external-datasets", "2",
 ]
 subprocess.check_call(cmd_pub)
 
 print("\n✅ Training + publication packaging completed.")
 print("Outputs saved to:", OUTPUT_DIR)
 print("Model stats saved to:", os.path.join(OUTPUT_DIR, "model_stats.json"))
+```
+
+
+### After training: generate image comparison figures
+
+Run this in a new Colab cell after training:
+
+```python
+fig_dir = os.path.join(OUTPUT_DIR, "figures")
+subprocess.check_call([
+    sys.executable, "generate_publication_figures.py",
+    "--metrics-json", os.path.join(OUTPUT_DIR, "metrics_internal.json"),
+    "--data-dir", TRAIN_DATA_DIRS[0],
+    "--output-dir", fig_dir,
+    "--image-size", str(IMAGE_SIZE),
+    "--num-samples", "6",
+])
+print("Figure outputs:", fig_dir)
 ```

@@ -1,5 +1,7 @@
 # Colab Single-Cell Runner (Train All + Publishable Outputs)
 
+> If you see `SyntaxError` near ``` in a notebook cell, you likely pasted markdown fences. Use `!python COLAB_SINGLE_CELL.py` instead.
+
 This cell will:
 1. mount Google Drive,
 2. install deps,

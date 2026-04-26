@@ -2,6 +2,9 @@
 
 ## Quick bootstrap (run this first in Colab)
 
+**Important:** in Colab, paste only Python lines into a code cell.  
+**Do not paste markdown fences** like ```` ```python ```` or ```` ``` ````.
+
 ```python
 import os, subprocess
 REPO_URL = "https://github.com/abdulkareem/ensemble_higherversion.git"
@@ -15,7 +18,13 @@ if not os.path.exists(REPO_DIR):
 !python /content/ensemble_higherversion/COLAB_SINGLE_CELL.py
 ```
 
-> If you see `SyntaxError` near ``` in a notebook cell, you likely pasted markdown fences. Use `!python COLAB_SINGLE_CELL.py` instead.
+If you already cloned the repo, you can run this single line in a Colab code cell:
+
+```python
+!python /content/ensemble_higherversion/COLAB_SINGLE_CELL.py
+```
+
+> If you see `SyntaxError` near ``` in a notebook cell, remove the markdown fence lines and run only the Python commands.
 
 This cell will:
 1. mount Google Drive,
